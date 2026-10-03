@@ -66,7 +66,14 @@ status_pull() {   # IP NAME
             ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no \
                 -o NumberOfPasswordPrompts=1 -o ConnectTimeout=10 \
                 -o ServerAliveInterval=15 -o ServerAliveCountMax=2 -o StrictHostKeyChecking=no "lasimeri@$1" \
-            "bash -c 'while :; do cat /dev/shm/facetrack.status 2>/dev/null; sleep 1; done'" 2>/dev/null |
+            "bash -c 'while :; do cat /dev/shm/facetrack.status /dev/shm/mic.status 2>/dev/null; sleep 1; done'" 2>/dev/null |
+            while IFS= read -r line; do
+                # The camera's line goes to NAME, the voice detector's (mic=) to mic-NAME.
+                case "$line" in *" mic="*) f="mic-$2"; prev=${lastm:-}; lastm=$line ;; *) f="$2"; prev=${last:-}; last=$line ;; esac
+                [ "$line" = "$prev" ] && continue
+                printf '%s\n' "$line" > "$feeds/$f.status.tmp" && mv "$feeds/$f.status.tmp" "$feeds/$f.status"
+                printf '%s\n' "$line" >> "$feeds/$f.log"
+            done|
             while IFS= read -r line; do
                 [ "$line" = "${last:-}" ] && continue
                 last=$line
