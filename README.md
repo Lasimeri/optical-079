@@ -6,7 +6,7 @@ Everything runs on your own GPU. Face detection uses OpenCV's OpenCL path (any G
 
 ## What it does
 
-- **`facetrack`** - captures a webcam, detects a face on the GPU, draws a white corner-bracket reticle with a crosshair and a `SUBJECT: ADMIN` lock, plus a faint grid, frame, and `079 // OPTICAL FEED` HUD. Streams the annotated video to the player and keeps the newest frame as a photo.
+- **`facetrack`** - captures a webcam, detects a face on the GPU, draws a white corner-bracket reticle with a crosshair and a `SUBJECT: ADMIN` lock, plus a faint grid, frame, and `888 // OPTICAL FEED` HUD. Streams the annotated video to the player and keeps the newest frame as a photo.
 - **`cam079`** - runs one or two webcams in always-on-top windows (inside + outside, side by side), with GPU upscaling (a Jinc scaler plus matched chroma scaling, and the AMD FSR shader) and a low-latency, no-buffer pipeline. The inside camera runs through `facetrack` automatically.
 - **`facegate`** - watches the latest frame and writes whether a face is present and facing the screen, so the voice assistant can listen only when you are there (fails open).
 
