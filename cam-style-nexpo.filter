@@ -1,0 +1,9 @@
+format=gbrp,
+eq=saturation=0.35:contrast=1.25:gamma=1.7:brightness=-0.01,
+rgbashift=rh=-5:bh=5,
+noise=alls=20:allf=t+u,
+vignette=PI/4,
+drawgrid=w=iw:h=3:t=1:c=black@0.35,
+drawtext=fontfile=/usr/share/fonts/TTF/DejaVuSansMono-Bold.ttf:text='● REC':x=w-170:y=24:fontsize=32:fontcolor=0xff2020,
+drawtext=fontfile=/usr/share/fonts/TTF/DejaVuSansMono.ttf:text='%{localtime\:%b %d %Y  %T}':x=28:y=h-56:fontsize=30:fontcolor=white@0.85,
+drawtext=fontfile=/usr/share/fonts/TTF/DejaVuSansMono.ttf:text='CAM 079':x=28:y=24:fontsize=30:fontcolor=white@0.8

@@ -1,0 +1,212 @@
+#!/bin/bash
+# cam079: the webcam on (its light on), its newest frame kept as one file,
+# replaced every second: ~/.cache/voice-079/cam/latest.jpg (nothing else is
+# kept). For Claude to look when asked, and for the voice to tell whether
+# the person faces the computer.
+#   cam079 start | view (a live window too) | style machine|nexpo|raw | stop | status
+set -u
+dir="$HOME/.cache/voice-079/cam"
+# Proper scaling for every feed (mpv, on the 3090 Ti): a Jinc upscaler
+# (ewa_lanczossharp) for luma, the SAME scaler for chroma so the camera's
+# subsampled colour plane is interpolated to full resolution rather than
+# doubled by the default (mpv reads the chroma siting from the stream),
+# Mitchell for any downscale done in light with ringing corrected, sigmoid
+# upscaling to hold edges without haloing, and dithering so the 8-bit output
+# shows no banding. FSR still does the final stretch to the screen on top.
+MPV_HQ="--scale=ewa_lanczossharp --cscale=ewa_lanczossharp --dscale=mitchell \
+ --correct-downscaling=yes --linear-downscaling=yes \
+ --sigmoid-upscaling=yes --dither-depth=auto --temporal-dither=yes"
+pidf="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/speak-079/cam.pid"
+mkdir -p "$dir" "$(dirname "$pidf")"
+# The best camera there is: of every capture device, the one whose largest
+# MJPEG size at 30 frames a second or more is biggest (a new, better webcam
+# wins over the C310 without being told). Prints the device, size and rate.
+find_cam() {
+    local best="" bestpx=0
+    for v in /sys/class/video4linux/video*; do
+        local dv="/dev/$(basename "$v")"
+        local m
+        m=$(v4l2-ctl -d "$dv" --list-formats-ext 2>/dev/null | awk '
+            /\[[0-9]+\]:/ { mj = ($0 ~ /MJPG/) }
+            mj && /Size/ { s = $3 }
+            mj && /Interval/ { f = $4; gsub(/[(]/, "", f); if (f + 0 >= 30) { split(s, wh, "x"); px = wh[1] * wh[2]; if (px > bp || (px == bp && f + 0 > bf)) { bp = px; bs = s; bf = f + 0 } } }
+            END { if (bp) print bp, bs, bf }')
+        [ -n "$m" ] || continue
+        set -- $m
+        if [ "$1" -gt "$bestpx" ]; then bestpx=$1; best="$dv $2 $3"; fi
+    done
+    echo "$best"
+}
+read -r dev cam_size cam_fps <<< "$(find_cam)"
+# The other capture camera (any but the given one) that streams MJPEG.
+other_cam() {
+    for v in /sys/class/video4linux/video*; do
+        local dv="/dev/$(basename "$v")"
+        [ "$dv" = "$1" ] && continue
+        grep -qF "$(cat "/sys/class/video4linux/$(basename "$1")/name" 2>/dev/null)" "$v/name" 2>/dev/null && continue
+        v4l2-ctl -d "$dv" --list-formats 2>/dev/null | grep -q MJPG && { echo "$dv"; return; }
+    done
+}
+case "${1:-}" in
+    start)
+        if [ -f "$pidf" ] && kill -0 "$(cat "$pidf")" 2>/dev/null; then echo "cam079: already on"; exit 0; fi
+        [ -n "$dev" ] || { echo "cam079: no webcam found" >&2; exit 1; }
+        setsid ffmpeg -loglevel error -nostdin -f v4l2 -input_format mjpeg -video_size "$cam_size" -framerate "$cam_fps" -i "$dev" \
+            -vf fps=1 -update 1 -y "$dir/latest.jpg" > "$dir/cam.log" 2>&1 < /dev/null &
+        echo $! > "$pidf"
+        echo "cam079: on ($dev), newest frame in $dir/latest.jpg"
+        ;;
+    view)
+        # The same, and a live window of what it sees (one capture feeds both:
+        # the camera opens once).
+        "$0" stop > /dev/null
+        # The old capture lets the camera go first (opened at once, "busy").
+        for _ in 1 2 3 4 5 6 7 8 9 10; do fuser "$dev" > /dev/null 2>&1 || break; sleep 0.2; done
+        [ -n "$dev" ] || { echo "cam079: no webcam found" >&2; exit 1; }
+        setsid "$0" _view > "$dir/cam.log" 2>&1 < /dev/null &
+        echo $! > "$pidf"
+        echo "cam079: on, with a window ($dev)"
+        ;;
+    _split)
+        # Both cameras side by side: the best one (inside, the person) and the
+        # other (outside, at the window), each in its own look, scaled to 720
+        # lines, stacked; the inside one's newest frame kept for Claude, the
+        # outside one's too (latest-out.jpg).
+        # Each camera is its own capture and its own window, side by side:
+        # one ffmpeg stacking both (hstack) held every inside frame until the
+        # outside camera (0.2 s exposures at night, about 5 frames a second)
+        # had a later one, and the waiting frames piled up in the capture
+        # queues, so the delay wandered up to a second and the two halves
+        # drifted apart. Apart, neither waits for the other. Even pacing over
+        # low delay: each frame stamped with the wall clock as it is read,
+        # and mpv plays by those stamps from a quarter-second buffer, so
+        # frames show at the camera's own cadence however unevenly they
+        # arrive.
+        here=$(dirname "$0")
+        _split_one() {   # SIDE (inside|outside) STYLE SNAPSHOT
+            local side=$1 style=$2 snap=$3 d size fps
+            while :; do
+                read -r d size fps <<< "$(find_cam)"
+                [ "$side" = outside ] && { d=$(other_cam "$d"); size=1280x960; fps=30; }
+                if [ -z "$d" ]; then sleep 1; continue; fi
+                local g n p
+                if [ "$side" = inside ] && [ -x "$here/facetrack" ] && [ "${CAM079_TRACK:-1}" != 0 ]; then
+                    # The inside camera through facetrack: OpenCV face detection
+                    # (OpenCL on the GPU) draws a Machine-style reticle on the
+                    # admin, plus the grid, frame and HUD; it keeps the newest
+                    # frame itself. mpv still upscales (FSR + the HQ scalers).
+                    FACETRACK_SNAP="$snap" "$here/facetrack" "$d" "${size%x*}" "${size#*x}" "SUBJECT: ADMIN" 2>> "$dir/cam.log" |
+                        mpv --really-quiet --profile=low-latency --untimed --no-cache \
+                            $MPV_HQ --glsl-shaders="$here/shaders/FSR.glsl" \
+                            --ontop --no-border --screen-name="${CAM079_SCREEN:-DP-2}" \
+                            --title="079 $side" - &
+                    p=$!
+                else
+                    g=$(tr -d '\n' < "$here/cam-style-$style.filter")
+                    n=$(printf '%s' "$g" | wc -c)
+                    ffmpeg -loglevel error -nostdin -xerror -fflags nobuffer -flags low_delay \
+                        -f v4l2 -input_format mjpeg -video_size "$size" -framerate "$fps" -i "$d" \
+                        -map 0 -vf fps=1 -update 1 -y "$snap" -map 0 -c:v copy -f nut - |
+                        mpv --really-quiet --demuxer-lavf-format=nut \
+                            --profile=low-latency --untimed --no-cache \
+                            $MPV_HQ --glsl-shaders="$here/shaders/FSR.glsl" \
+                            --ontop --no-border --screen-name="${CAM079_SCREEN:-DP-2}" \
+                            --title="079 $side" --vf="lavfi=graph=%$n%$g" - &
+                    p=$!
+                fi
+                # Placed again as it comes up: the night camera's first frame can
+                # take seconds, and an unplaced window opened on the streamed screen.
+                ( for t in 1 1 2 3 5 8; do sleep "$t"; _split_place; done ) &
+                wait "$p"
+                sleep 1
+            done
+        }
+        # The two windows on the camera screen (CAM079_SCREEN, DP-2), the
+        # inside one (16:9) on the left and the outside one (4:3) on the
+        # right, at one height that fills the width, centred, kept above.
+        _split_place() {
+            local geo sx sy sw sh h wi wo js id
+            geo=$(kscreen-doctor -o 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' |
+                awk -v s="${CAM079_SCREEN:-DP-2}" '$1 == "Output:" { on = ($3 == s) } on && $1 == "Geometry:" { print $2, $3; exit }')
+            [ -n "$geo" ] || return
+            sx=${geo%%,*}; sy=${geo#*,}; sy=${sy%% *}; sw=${geo##* }; sh=${sw#*x}; sw=${sw%x*}
+            h=$(( sw * 9 * 3 / (16 * 3 + 4 * 9) )); [ "$h" -gt "$sh" ] && h=$sh
+            wi=$(( h * 16 / 9 )); wo=$(( h * 4 / 3 ))
+            js="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/speak-079/split.js"
+            cat > "$js" <<EOF
+var ws = workspace.windowList(), x = $sx + Math.floor(($sw - $wi - $wo) / 2), y = $sy + Math.floor(($sh - $h) / 2);
+for (var i = 0; i < ws.length; i++) {
+    var c = ws[i].caption;
+    if (c == "079 inside") { ws[i].noBorder = true; ws[i].keepAbove = true; ws[i].frameGeometry = {x: x, y: y, width: $wi, height: $h}; }
+    if (c == "079 outside") { ws[i].noBorder = true; ws[i].keepAbove = true; ws[i].frameGeometry = {x: x + $wi, y: y, width: $wo, height: $h}; }
+}
+EOF
+            id=$(qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.loadScript "$js" cam079split 2>/dev/null)
+            [ -n "$id" ] && qdbus6 org.kde.KWin "/Scripting/Script$id" org.kde.kwin.Script.run > /dev/null 2>&1
+            qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript cam079split > /dev/null 2>&1
+        }
+        _split_one inside "${CAM079_INSIDE:-admin}" "$dir/latest.jpg" &
+        _split_one outside "${CAM079_OUTSIDE:-night}" "$dir/latest-out.jpg" &
+        wait
+        ;;
+    _view)
+        # The capture and its window, started again whenever the camera
+        # comes back (moved to another port, plugged in again).
+        while :; do
+            read -r d size fps <<< "$(find_cam)"
+            if [ -z "$d" ]; then sleep 1; continue; fi
+            # The window: mpv, the look applied by lavfi, and FSR (AMD's open
+            # spatial upscaler, a GPU shader of a few kilobytes) for the stretch to
+            # the screen; the closest thing to DLSS a webcam can have.
+            g=$(tr -d '\n' < "$(dirname "$0")/cam-style-$(cat "$dir/style" 2>/dev/null || echo machine).filter")
+            n=$(printf '%s' "$g" | wc -c)
+            ffmpeg -loglevel error -nostdin -xerror -fflags nobuffer -flags low_delay -f v4l2 -input_format mjpeg -video_size "$size" -framerate "$fps" -i "$d" \
+                -map 0 -vf fps=1 -update 1 -y "$dir/latest.jpg" -map 0 -c:v copy -f nut - |
+                mpv --really-quiet --demuxer-lavf-format=nut \
+                    --profile=low-latency --untimed --no-cache \
+                    $MPV_HQ --glsl-shaders="$(dirname "$0")/shaders/FSR.glsl" --ontop --title='What Claude sees' \
+                    --vf="lavfi=graph=%$n%$g" --fs --fs-screen-name="${CAM079_SCREEN:-DP-2}" -
+            sleep 1
+        done
+        ;;
+    split)
+        # Both cameras at once (inside: the best one; outside: the other).
+        "$0" stop > /dev/null
+        o=$(other_cam "$dev")
+        [ -n "$o" ] || { echo "cam079: only one camera" >&2; exit 1; }
+        gmax=$(v4l2-ctl -d "$o" --list-ctrls 2>/dev/null | awk '$1 == "gain" {for (i = 1; i <= NF; i++) if ($i ~ /^max=/) print substr($i, 5)}')
+        [ "${CAM079_OUTSIDE:-night}" = night ] && v4l2-ctl -d "$o" -c auto_exposure=1 -c exposure_time_absolute=2000 -c gain=$(( ${gmax:-255} * 4 / 5 )) 2>/dev/null
+        for _ in 1 2 3 4 5 6 7 8 9 10; do fuser "$dev" "$o" > /dev/null 2>&1 || break; sleep 0.2; done
+        setsid "$0" _split > "$dir/cam.log" 2>&1 < /dev/null &
+        echo $! > "$pidf"
+        echo "cam079: both cameras ($dev inside, $o outside)"
+        ;;
+    style)
+        # The window's look: machine (The Machine's optical feed), nexpo (an
+        # analog tape: grain, colour bleed, scan lines, REC), raw.
+        s=${2:-machine}
+        [ "$s" = raw ] && { printf 'null\n' > "$(dirname "$0")/cam-style-raw.filter"; }
+        [ -f "$(dirname "$0")/cam-style-$s.filter" ] || { echo "cam079: no style $s" >&2; exit 1; }
+        echo "$s" > "$dir/style"
+        # Night: the sensor held open longer (0.2 s a frame, gain near the top;
+        # the frame rate falls, a still yard does not mind) and eight frames
+        # averaged in the look (tmix); any other look gives exposure back to
+        # the camera.
+        if [ "$s" = night ]; then
+            gmax=$(v4l2-ctl -d "$dev" --list-ctrls 2>/dev/null | awk '$1 == "gain" {for (i = 1; i <= NF; i++) if ($i ~ /^max=/) print substr($i, 5)}')
+            v4l2-ctl -d "$dev" -c auto_exposure=1 -c exposure_time_absolute=2000 -c gain=$(( ${gmax:-255} * 4 / 5 )) 2>/dev/null
+        else
+            v4l2-ctl -d "$dev" -c auto_exposure=3 -c gain=32 2>/dev/null
+        fi
+        exec "$0" view
+        ;;
+    stop)
+        [ -f "$pidf" ] && { kill -- -"$(cat "$pidf")" 2>/dev/null || kill "$(cat "$pidf")" 2>/dev/null; }
+        rm -f "$pidf"
+        echo "cam079: off"
+        ;;
+    status)
+        if [ -f "$pidf" ] && kill -0 "$(cat "$pidf")" 2>/dev/null; then echo "cam079: on"; else echo "cam079: off"; fi
+        ;;
+    *) echo "cam079 start|view|stop|status" >&2; exit 1 ;;
+esac
