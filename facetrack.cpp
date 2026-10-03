@@ -180,7 +180,7 @@ int main(int argc, char** argv) {
         // HUD: timestamp top, label bottom (yellow), tracking state
         char ts[32]; time_t now = time(nullptr); struct tm tmv; localtime_r(&now, &tmv);
         std::strftime(ts, sizeof ts, "%H:%M:%S", &tmv);
-        char top[80]; std::snprintf(top, sizeof top, "079 // OPTICAL FEED // %s", ts);
+        char top[80]; std::snprintf(top, sizeof top, "888 // OPTICAL FEED // %s", ts);
         cv::putText(frame, top, cv::Point(24, 34), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 0, 0), 3, cv::LINE_AA);
         cv::putText(frame, top, cv::Point(24, 34), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
         cv::putText(frame, label, cv::Point(24, H - 22), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 0, 0), 3, cv::LINE_AA);
