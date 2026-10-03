@@ -15,6 +15,7 @@
 #   --stop         unload the resident script
 set -u
 screen="${CAM079_SCREEN:-DP-2}"
+layout="${CAM079_LAYOUT:-featured}"     # featured (one big + the rest stacked) | grid
 rt="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/speak-079"
 mkdir -p "$rt"
 name=cam079grid
@@ -36,26 +37,46 @@ function camWindows(skip) {
     for (var k = 0; k < ORDER.length; k++) if (byCap[ORDER[k]]) out.push(byCap[ORDER[k]]);
     return out;
 }
+var LAYOUT = "$layout";
+// One window into a cell: its picture's aspect, as large as fits, centred.
+function place(win, cx, cy, cw, ch) {
+    var a = ASPECT[win.caption] || 16 / 9;
+    var w = cw, h = Math.floor(cw / a);
+    if (h > ch) { h = ch; w = Math.floor(ch * a); }
+    var x = cx + Math.floor((cw - w) / 2), y = cy + Math.floor((ch - h) / 2);
+    var f = win.frameGeometry;
+    win.noBorder = true; win.keepAbove = true;
+    // only move what is off target: no feedback loop with resize signals
+    if (Math.abs(f.x - x) > 2 || Math.abs(f.y - y) > 2 || Math.abs(f.width - w) > 2 || Math.abs(f.height - h) > 2)
+        win.frameGeometry = {x: x, y: y, width: w, height: h};
+}
 function layout(skip) {
     var g = screenGeo(); if (!g) return;
     var wins = camWindows(skip), n = wins.length; if (!n) return;
-    var cols = Math.ceil(Math.sqrt(n)), rows = Math.ceil(n / cols);
-    var cw = Math.floor(g.width / cols), ch = Math.floor(g.height / rows);
-    for (var i = 0; i < n; i++) {
-        var r = Math.floor(i / cols), c = i % cols;
-        var inRow = (r == rows - 1) ? n - r * cols : cols;
-        var off = Math.floor((g.width - inRow * cw) / 2);
-        var a = ASPECT[wins[i].caption] || 16 / 9;
-        var w = cw, h = Math.floor(cw / a);
-        if (h > ch) { h = ch; w = Math.floor(ch * a); }
-        var x = g.x + off + c * cw + Math.floor((cw - w) / 2);
-        var y = g.y + r * ch + Math.floor((ch - h) / 2);
-        var f = wins[i].frameGeometry;
-        wins[i].noBorder = true; wins[i].keepAbove = true;
-        // only move what is off target: no feedback loop with resize signals
-        if (Math.abs(f.x - x) > 2 || Math.abs(f.y - y) > 2 || Math.abs(f.width - w) > 2 || Math.abs(f.height - h) > 2)
-            wins[i].frameGeometry = {x: x, y: y, width: w, height: h};
+    if (n == 1) { place(wins[0], g.x, g.y, g.width, g.height); return; }
+    if (LAYOUT == "grid") {
+        var cols = Math.ceil(Math.sqrt(n)), rows = Math.ceil(n / cols);
+        var cw = Math.floor(g.width / cols), ch = Math.floor(g.height / rows);
+        for (var i = 0; i < n; i++) {
+            var r = Math.floor(i / cols), c = i % cols;
+            var inRow = (r == rows - 1) ? n - r * cols : cols;
+            var off = Math.floor((g.width - inRow * cw) / 2);
+            place(wins[i], g.x + off + c * cw, g.y + r * ch, cw, ch);
+        }
+        return;
     }
+    // "featured" (the default): two side by side; three or more, the first
+    // (the inside camera, the person) large on the left two thirds and the
+    // rest stacked down the right.
+    if (n == 2) {
+        var hw = Math.floor(g.width / 2);
+        place(wins[0], g.x, g.y, hw, g.height);
+        place(wins[1], g.x + hw, g.y, g.width - hw, g.height);
+        return;
+    }
+    var bw = Math.floor(g.width * 2 / 3), sw = g.width - bw, sh = Math.floor(g.height / (n - 1));
+    place(wins[0], g.x, g.y, bw, g.height);
+    for (var j = 1; j < n; j++) place(wins[j], g.x + bw, g.y + (j - 1) * sh, sw, sh);
 }
 EOF
 }

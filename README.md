@@ -97,3 +97,5 @@ Stop the laptop feeds with `kill -- -$(cat $XDG_RUNTIME_DIR/speak-079/lapcams.pi
 ## Self-arranging layout
 
 `cam-grid-place --watch` loads a resident KWin script that re-lays out the camera windows the moment one appears, closes, retitles or resizes itself, so a camera reconnecting or a laptop coming back online snaps straight into place, with no polling. The layout adapts to how many cameras are present: one fills the screen, two sit side by side, three go two over one (the short row centred), four make a 2x2 grid. Each window keeps its picture's aspect. Run `cam-grid-place` with no argument to lay out once, or `--stop` to unload the script. `lapcams.sh` reconnects a dropped laptop feed by itself: its SSH link feeds mpv through a FIFO, so closing the window ends the link too and the loop starts over.
+
+**Layouts.** `CAM079_LAYOUT=featured` (the default) puts the first camera present (the inside one, the person) large on the left two-thirds and stacks the rest down the right. Two cameras sit side by side, and one fills the screen. `CAM079_LAYOUT=grid` gives the even grid instead (2 side by side, 3 two over one, 4 a 2x2 grid).
