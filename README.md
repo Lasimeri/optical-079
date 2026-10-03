@@ -93,3 +93,7 @@ Stop the laptop feeds with `kill -- -$(cat $XDG_RUNTIME_DIR/speak-079/lapcams.pi
 
 - `cam079 split` runs with only one camera. The outside camera joins on its own when plugged in, and its night exposure is re-applied on every (re)start, so a replugged camera doesn't come back on auto exposure.
 - Camera device numbers can change when a webcam resets on USB. The runners find cameras by capability each time they (re)start, not by fixed `/dev/videoN` paths.
+
+## Self-arranging layout
+
+`cam-grid-place --watch` loads a resident KWin script that re-lays out the camera windows the moment one appears, closes, retitles or resizes itself, so a camera reconnecting or a laptop coming back online snaps straight into place, with no polling. The layout adapts to how many cameras are present: one fills the screen, two sit side by side, three go two over one (the short row centred), four make a 2x2 grid. Each window keeps its picture's aspect. Run `cam-grid-place` with no argument to lay out once, or `--stop` to unload the script. `lapcams.sh` reconnects a dropped laptop feed by itself: its SSH link feeds mpv through a FIFO, so closing the window ends the link too and the loop starts over.

@@ -22,16 +22,24 @@ MPV_HQ="--scale=ewa_lanczossharp --cscale=ewa_lanczossharp --dscale=mitchell \
  --correct-downscaling=yes --linear-downscaling=yes \
  --sigmoid-upscaling=yes --dither-depth=auto --temporal-dither=yes"
 pull() {   # IP TITLE
+    # ssh feeds mpv through a FIFO, not a pipe: if the window is closed, ssh
+    # does not notice for a long time (its writes just fail), and a pipeline
+    # would wait on it, so the feed never came back. Here, whichever end goes
+    # first, the other is ended and the loop reconnects.
+    local fifo="$rt/lapcam-${2// /_}.fifo" sp
     while :; do
+        rm -f "$fifo"; mkfifo "$fifo"
         env SSH_ASKPASS="$A" SSH_ASKPASS_REQUIRE=force DISPLAY=:0 \
             ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no \
                 -o NumberOfPasswordPrompts=1 -o ConnectTimeout=10 \
-                -o ServerAliveInterval=15 -o StrictHostKeyChecking=no "lasimeri@$1" \
-            "bash -c 'while :; do cat /dev/shm/facetrack.jpg 2>/dev/null; sleep 0.066; done'" 2>/dev/null |
-            mpv --really-quiet --profile=low-latency --untimed --no-cache \
-                --demuxer-lavf-format=mjpeg $MPV_HQ --glsl-shaders="$here/shaders/FSR.glsl" \
-                --ontop --no-border --screen-name="${CAM079_SCREEN:-DP-2}" \
-                --title="$2" - 2>/dev/null
+                -o ServerAliveInterval=15 -o ServerAliveCountMax=2 -o StrictHostKeyChecking=no "lasimeri@$1" \
+            "bash -c 'while :; do cat /dev/shm/facetrack.jpg 2>/dev/null; sleep 0.066; done'" > "$fifo" 2>/dev/null &
+        sp=$!
+        mpv --really-quiet --profile=low-latency --untimed --no-cache \
+            --demuxer-lavf-format=mjpeg $MPV_HQ --glsl-shaders="$here/shaders/FSR.glsl" \
+            --ontop --no-border --screen-name="${CAM079_SCREEN:-DP-2}" \
+            --title="$2" - < "$fifo" 2>/dev/null
+        kill "$sp" 2>/dev/null; wait "$sp" 2>/dev/null
         sleep 2
     done
 }

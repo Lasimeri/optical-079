@@ -1,31 +1,98 @@
 #!/bin/bash
-# cam-grid-place: the four camera windows in a 2x2 grid on the camera screen
-# (CAM079_SCREEN, default DP-2): "079 inside" top left, "079 outside" top
-# right, "079 laptop" bottom left, "079 bedroom" bottom right. Each window
-# fills its cell and mpv keeps the picture's aspect inside it. Used by cam079
-# (when $XDG_RUNTIME_DIR/speak-079/camgrid exists) and by lapcams.sh.
+# cam-grid-place [--watch | --stop]: the camera windows ("079 inside",
+# "079 outside", "079 laptop", "079 bedroom") laid out on the camera screen
+# (CAM079_SCREEN, default DP-2), adapting to however many are open: one fills
+# the screen, two sit side by side, three go two over one (the short row
+# centred), four make a 2x2 grid. Each keeps its picture's aspect (16:9 or
+# 4:3), centred in its cell, borderless and above other windows. The order
+# is fixed (inside, outside, laptop, bedroom), so a camera keeps its place
+# relative to the others.
+#   (no argument)  lay out once
+#   --watch        load it as a resident KWin script that lays out again the
+#                  moment a camera window appears, closes, retitles or resizes
+#                  itself: a camera reconnecting or a laptop coming back snaps
+#                  straight into place, with no polling
+#   --stop         unload the resident script
 set -u
-geo=$(kscreen-doctor -o 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' |
-    awk -v s="${CAM079_SCREEN:-DP-2}" '$1 == "Output:" { on = ($3 == s) } on && $1 == "Geometry:" { print $2, $3; exit }')
-[ -n "$geo" ] || exit 0
-sx=${geo%%,*}; sy=${geo#*,}; sy=${sy%% *}; sw=${geo##* }; sh=${sw#*x}; sw=${sw%x*}
-cw=$(( sw / 2 )); ch=$(( sh / 2 ))
-# 16:9 feeds fill the cell; 4:3 feeds (the outside camera, 1280x960, and the
-# bedroom laptop, 640x480) get a 4:3 window centred in theirs, else mpv grows
-# the window to keep the aspect and it spills into the row below.
-w43=$(( ch * 4 / 3 )); [ "$w43" -gt "$cw" ] && w43=$cw
-o43=$(( (cw - w43) / 2 ))
-js="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/speak-079/grid.js"
-cat > "$js" <<EOF
-var ws = workspace.windowList();
-var cells = {"079 inside": [$sx, $sy, $cw], "079 outside": [$sx + $cw + $o43, $sy, $w43],
-             "079 laptop": [$sx, $sy + $ch, $cw], "079 bedroom": [$sx + $cw + $o43, $sy + $ch, $w43]};
-for (var i = 0; i < ws.length; i++) {
-    var p = cells[ws[i].caption];
-    if (p) { ws[i].noBorder = true; ws[i].keepAbove = true; ws[i].frameGeometry = {x: p[0], y: p[1], width: p[2], height: $ch}; }
+screen="${CAM079_SCREEN:-DP-2}"
+rt="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/speak-079"
+mkdir -p "$rt"
+name=cam079grid
+
+layout_js() {
+cat <<EOF
+var SCREEN = "$screen";
+var ORDER = ["079 inside", "079 outside", "079 laptop", "079 bedroom"];
+var ASPECT = {"079 inside": 16 / 9, "079 outside": 4 / 3, "079 laptop": 16 / 9, "079 bedroom": 4 / 3};
+function screenGeo() {
+    var ss = workspace.screens;
+    for (var i = 0; i < ss.length; i++) if (ss[i].name == SCREEN) return ss[i].geometry;
+    return null;
+}
+function camWindows(skip) {
+    var ws = workspace.windowList(), byCap = {};
+    for (var i = 0; i < ws.length; i++) if (ws[i] !== skip) byCap[ws[i].caption] = ws[i];
+    var out = [];
+    for (var k = 0; k < ORDER.length; k++) if (byCap[ORDER[k]]) out.push(byCap[ORDER[k]]);
+    return out;
+}
+function layout(skip) {
+    var g = screenGeo(); if (!g) return;
+    var wins = camWindows(skip), n = wins.length; if (!n) return;
+    var cols = Math.ceil(Math.sqrt(n)), rows = Math.ceil(n / cols);
+    var cw = Math.floor(g.width / cols), ch = Math.floor(g.height / rows);
+    for (var i = 0; i < n; i++) {
+        var r = Math.floor(i / cols), c = i % cols;
+        var inRow = (r == rows - 1) ? n - r * cols : cols;
+        var off = Math.floor((g.width - inRow * cw) / 2);
+        var a = ASPECT[wins[i].caption] || 16 / 9;
+        var w = cw, h = Math.floor(cw / a);
+        if (h > ch) { h = ch; w = Math.floor(ch * a); }
+        var x = g.x + off + c * cw + Math.floor((cw - w) / 2);
+        var y = g.y + r * ch + Math.floor((ch - h) / 2);
+        var f = wins[i].frameGeometry;
+        wins[i].noBorder = true; wins[i].keepAbove = true;
+        // only move what is off target: no feedback loop with resize signals
+        if (Math.abs(f.x - x) > 2 || Math.abs(f.y - y) > 2 || Math.abs(f.width - w) > 2 || Math.abs(f.height - h) > 2)
+            wins[i].frameGeometry = {x: x, y: y, width: w, height: h};
+    }
 }
 EOF
-id=$(qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.loadScript "$js" cam079grid 2>/dev/null)
-[ -n "$id" ] && qdbus6 org.kde.KWin "/Scripting/Script$id" org.kde.kwin.Script.run > /dev/null 2>&1
-qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript cam079grid > /dev/null 2>&1
+}
+
+unload() { qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript "$1" > /dev/null 2>&1; }
+run() {   # FILE NAME
+    local id
+    id=$(qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.loadScript "$1" "$2" 2>/dev/null)
+    [ -n "$id" ] && qdbus6 org.kde.KWin "/Scripting/Script$id" org.kde.kwin.Script.run > /dev/null 2>&1
+}
+
+case "${1:-}" in
+--watch)
+    js="$rt/gridwatch.js"
+    { layout_js; cat <<'EOF'
+function isCam(w) { return w && w.caption && w.caption.indexOf("079 ") == 0; }
+function hook(w) {
+    if (!w) return;
+    w.captionChanged.connect(function () { if (isCam(w)) layout(); });
+    w.frameGeometryChanged.connect(function () { if (isCam(w)) layout(); });
+}
+var all = workspace.windowList();
+for (var i = 0; i < all.length; i++) hook(all[i]);
+workspace.windowAdded.connect(function (w) { hook(w); if (isCam(w)) layout(); });
+workspace.windowRemoved.connect(function (w) { if (isCam(w)) layout(w); });
+layout();
+EOF
+    } > "$js"
+    unload "${name}watch"; run "$js" "${name}watch"
+    echo "cam-grid-place: watching (cameras re-lay out on connect and disconnect)"
+    ;;
+--stop)
+    unload "${name}watch"; echo "cam-grid-place: stopped watching" ;;
+*)
+    js="$rt/grid.js"
+    { layout_js; echo "layout();"; } > "$js"
+    run "$js" "$name"; unload "$name"
+    ;;
+esac
 exit 0
