@@ -17,6 +17,9 @@ MPV_HQ="--scale=ewa_lanczossharp --cscale=ewa_lanczossharp --dscale=mitchell \
  --correct-downscaling=yes --linear-downscaling=yes \
  --sigmoid-upscaling=yes --dither-depth=auto --temporal-dither=yes"
 pidf="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/speak-079/cam.pid"
+# What was on, and on which screen, kept across logins (state079).
+st="$(dirname "$(readlink -f "$0")")/state079"
+export CAM079_SCREEN="${CAM079_SCREEN:-$("$st" get screen DP-2)}"
 mkdir -p "$dir" "$(dirname "$pidf")"
 # The best camera there is: of every capture device, the one whose largest
 # MJPEG size at 30 frames a second or more is biggest (a new, better webcam
@@ -54,17 +57,19 @@ case "${1:-}" in
         setsid ffmpeg -loglevel error -nostdin -f v4l2 -input_format mjpeg -video_size "$cam_size" -framerate "$cam_fps" -i "$dev" \
             -vf fps=1 -update 1 -y "$dir/latest.jpg" > "$dir/cam.log" 2>&1 < /dev/null &
         echo $! > "$pidf"
+        "$st" set cams start
         echo "cam079: on ($dev), newest frame in $dir/latest.jpg"
         ;;
     view)
         # The same, and a live window of what it sees (one capture feeds both:
         # the camera opens once).
-        "$0" stop > /dev/null
+        "$0" _stop > /dev/null
         # The old capture lets the camera go first (opened at once, "busy").
         for _ in 1 2 3 4 5 6 7 8 9 10; do fuser "$dev" > /dev/null 2>&1 || break; sleep 0.2; done
         [ -n "$dev" ] || { echo "cam079: no webcam found" >&2; exit 1; }
         setsid "$0" _view > "$dir/cam.log" 2>&1 < /dev/null &
         echo $! > "$pidf"
+        "$st" set cams view
         echo "cam079: on, with a window ($dev)"
         ;;
     _split)
@@ -182,7 +187,7 @@ EOF
         ;;
     split)
         # Both cameras at once (inside: the best one; outside: the other).
-        "$0" stop > /dev/null
+        "$0" _stop > /dev/null
         o=$(other_cam "$dev")
         # The outside camera may be unplugged: the inside one runs anyway and
         # the outside loop picks its camera up when it is plugged back in
@@ -191,6 +196,7 @@ EOF
         for _ in 1 2 3 4 5 6 7 8 9 10; do fuser "$dev" ${o:+"$o"} > /dev/null 2>&1 || break; sleep 0.2; done
         setsid "$0" _split > "$dir/cam.log" 2>&1 < /dev/null &
         echo $! > "$pidf"
+        "$st" set cams split
         echo "cam079: both cameras ($dev inside, $o outside)"
         ;;
     style)
@@ -213,6 +219,12 @@ EOF
         exec "$0" view
         ;;
     stop)
+        # The person's stop: kept for the next login (state079). The verbs
+        # that restart the capture call _stop, which leaves the state alone.
+        "$0" _stop
+        "$st" set cams off
+        ;;
+    _stop)
         [ -f "$pidf" ] && { kill -- -"$(cat "$pidf")" 2>/dev/null || kill "$(cat "$pidf")" 2>/dev/null; }
         rm -f "$pidf"
         echo "cam079: off"

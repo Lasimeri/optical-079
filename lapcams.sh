@@ -5,11 +5,22 @@
 # into place so a reader never sees half a file); this pulls that file over
 # SSH as a live MJPEG stream into an mpv window (low latency, no cache, the
 # same GPU scalers and FSR as the desktop cameras). Reconnects on its own.
-#   start: setsid lapcams.sh &      stop: kill -- -$(cat $XDG_RUNTIME_DIR/speak-079/lapcams.pid)
+#   start: setsid lapcams.sh &      stop: lapcams.sh stop
+# Either is kept for the next login (state079): a stop stays stopped.
 set -u
 here=$(dirname "$(readlink -f "$0")")
 rt="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/speak-079"
 mkdir -p "$rt"
+st="$here/state079"
+export CAM079_SCREEN="${CAM079_SCREEN:-$("$st" get screen DP-2)}"
+if [ "${1:-}" = stop ]; then
+    [ -f "$rt/lapcams.pid" ] && kill -- -"$(cat "$rt/lapcams.pid")" 2>/dev/null
+    rm -f "$rt/lapcams.pid"
+    "$st" set lapcams off
+    echo "lapcams: off"
+    exit 0
+fi
+"$st" set lapcams on
 echo $$ > "$rt/lapcams.pid"
 touch "$rt/camgrid"
 # The laptops' SSH password stays out of the code: a private file

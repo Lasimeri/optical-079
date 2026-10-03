@@ -13,9 +13,25 @@
 #                  itself: a camera reconnecting or a laptop coming back snaps
 #                  straight into place, with no polling
 #   --stop         unload the resident script
+#   --layout L     featured | grid, kept for the next login, applied now
+#   --screen S     the camera screen (an output name), kept and applied now
 set -u
-screen="${CAM079_SCREEN:-DP-2}"
-layout="${CAM079_LAYOUT:-featured}"     # featured (one big + the rest stacked) | grid
+here=$(dirname "$(readlink -f "$0")")
+st="$here/state079"
+case "${1:-}" in
+    --layout|--screen)
+        [ -n "${2:-}" ] || { echo "cam-grid-place $1 VALUE" >&2; exit 1; }
+        "$st" set "${1#--}" "$2"
+        # Applied at once: the resident script reloaded with the new value.
+        if [ "$(qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.isScriptLoaded cam079gridwatch 2>/dev/null)" = true ]; then
+            exec "$0" --watch
+        fi
+        exec "$0"
+        ;;
+esac
+# The person's choice (state079), unless given for this run.
+screen="${CAM079_SCREEN:-$("$st" get screen DP-2)}"
+layout="${CAM079_LAYOUT:-$("$st" get layout featured)}"     # featured (one big + the rest stacked) | grid
 rt="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/speak-079"
 mkdir -p "$rt"
 name=cam079grid
@@ -102,6 +118,11 @@ var all = workspace.windowList();
 for (var i = 0; i < all.length; i++) hook(all[i]);
 workspace.windowAdded.connect(function (w) { hook(w); if (isCam(w)) layout(); });
 workspace.windowRemoved.connect(function (w) { if (isCam(w)) layout(w); });
+// The camera screen arriving late (at login the monitor may come up after
+// this script) or changing: lay out again, or nothing would until a camera
+// window moved.
+workspace.screensChanged.connect(function () { layout(); });
+workspace.virtualScreenGeometryChanged.connect(function () { layout(); });
 layout();
 EOF
     } > "$js"
