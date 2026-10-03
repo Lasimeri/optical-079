@@ -107,7 +107,12 @@ case "${1:-}" in
                     # (OpenCL on the GPU) draws a Machine-style reticle on the
                     # admin, plus the grid, frame and HUD; it keeps the newest
                     # frame itself. mpv still upscales (FSR + the HQ scalers).
-                    FACETRACK_SNAP="$snap" "$here/facetrack" "$d" "${size%x*}" "${size#*x}" "SUBJECT: ADMIN" 2>> "$dir/cam.log" |
+                    # Its status line each second (faces, lock, motion, light)
+                    # goes to $CAM079_FEEDS/inside.*, the Phi Stream's camera
+                    # monitor's feed (it reads text, not pictures).
+                    local feeds="${CAM079_FEEDS:-$HOME/.local/share/phi-stream/dev/feeds}"
+                    mkdir -p "$feeds"
+                    FACETRACK_STATUS="$feeds/inside" FACETRACK_SNAP="$snap" "$here/facetrack" "$d" "${size%x*}" "${size#*x}" "SUBJECT: ADMIN" 2>> "$dir/cam.log" |
                         mpv --really-quiet --profile=low-latency --untimed --no-cache \
                             $MPV_HQ --glsl-shaders="$here/shaders/FSR.glsl" \
                             --ontop --no-border --screen-name="${CAM079_SCREEN:-DP-2}" \

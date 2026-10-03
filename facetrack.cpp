@@ -14,6 +14,8 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/videoio.hpp>
 #include <opencv2/xobjdetect.hpp>
+#include <opencv2/objdetect.hpp>
+#include <opencv2/dnn.hpp>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -21,6 +23,8 @@
 #include <string>
 #include <ctime>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <algorithm>
 
 static std::string cascade_path() {
     const char* c[] = {
@@ -71,6 +75,19 @@ int main(int argc, char** argv) {
     std::string stream = streamenv ? streamenv : "";
     std::string stream_tmp = stream + ".tmp.jpg";
     std::vector<int> jq = {cv::IMWRITE_JPEG_QUALITY, 80};
+    // $FACETRACK_STATUS=PREFIX: what this camera saw, in words, for a monitor
+    // that cannot look at pictures (the Phi Stream's): once a second PREFIX.status
+    // is rewritten (temp name, then renamed) with one line, and the same line
+    // is appended to PREFIX.log (moved to PREFIX.log.1 past 2 MB):
+    //   t=UNIX_US cam=NAME faces=N locked=0|1 box=X,Y,W,H motion=0..1 light=0..255 fps=N
+    // faces: the most found in one frame that second; locked: the reticle on
+    // a face; motion: the largest mean frame difference that second (a 96 px
+    // wide grey picture, 0 still, 1 every pixel changed fully); light: the
+    // mean grey. $FACETRACK_CAM names the camera (default: PREFIX's base name).
+    const char* statenv = getenv("FACETRACK_STATUS");
+    std::string status = statenv ? statenv : "";
+    std::string camname = getenv("FACETRACK_CAM") ? getenv("FACETRACK_CAM")
+                        : status.substr(status.find_last_of('/') + 1);
     // Picture enhancement settings: FACETRACK_ENHANCE (default on),
     // FACETRACK_GAMMA (default 1.3, the old "admin" look), FACETRACK_CLAHE
     // (clip limit, default 2.0).
@@ -90,15 +107,43 @@ int main(int argc, char** argv) {
     bool gpu = cv::ocl::useOpenCL();
     std::fprintf(stderr, "facetrack: OpenCL %s\n", gpu ? cv::ocl::Device::getDefault().name().c_str() : "off (CPU)");
 
+    // The detector: YuNet (OpenCV's DNN face detector, a 230 KB ONNX model),
+    // on the GPU through OpenCL. The Haar cascade it replaced missed faces
+    // turned away or small in a dim room (at the 480 px it ran at, a face
+    // across the room was under its 40 px minimum). $FACETRACK_MODEL names
+    // the model (default: models/ beside this program); without it, the
+    // cascade as before. $FACETRACK_SCORE: the least confidence (0.6).
+    std::string exe_dir = ".";
+    { char b[4096]; ssize_t n = readlink("/proc/self/exe", b, sizeof b - 1);
+      if (n > 0) { b[n] = 0; exe_dir = std::string(b); exe_dir = exe_dir.substr(0, exe_dir.find_last_of('/')); } }
+    std::string model = getenv("FACETRACK_MODEL") ? getenv("FACETRACK_MODEL")
+                      : exe_dir + "/models/face_detection_yunet_2023mar.onnx";
+    float min_score = getenv("FACETRACK_SCORE") ? (float)atof(getenv("FACETRACK_SCORE")) : 0.6f;
+    cv::Ptr<cv::FaceDetectorYN> yunet;
+    if (access(model.c_str(), R_OK) == 0) {
+        int target = gpu ? cv::dnn::DNN_TARGET_OPENCL : cv::dnn::DNN_TARGET_CPU;
+        try {
+            yunet = cv::FaceDetectorYN::create(model, "", cv::Size(320, 320), min_score, 0.3f, 50,
+                                               cv::dnn::DNN_BACKEND_OPENCV, target);
+        } catch (const cv::Exception& e) {
+            std::fprintf(stderr, "facetrack: YuNet on %s failed (%s); CPU\n", gpu ? "OpenCL" : "CPU", e.what());
+            yunet = cv::FaceDetectorYN::create(model, "", cv::Size(320, 320), min_score, 0.3f, 50);
+        }
+        std::fprintf(stderr, "facetrack: YuNet %s, score >= %.2f\n", model.c_str(), min_score);
+    }
     cv::CascadeClassifier face;
     std::string cp = cascade_path();
-    if (cp.empty() || !face.load(cp)) { std::fprintf(stderr, "facetrack: no cascade\n"); return 1; }
+    if (!yunet && (cp.empty() || !face.load(cp))) { std::fprintf(stderr, "facetrack: no detector\n"); return 1; }
 
     cv::VideoCapture cap(dev, cv::CAP_V4L2);
     cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
     cap.set(cv::CAP_PROP_FRAME_WIDTH, W);
     cap.set(cv::CAP_PROP_FRAME_HEIGHT, H);
-    cap.set(cv::CAP_PROP_FPS, 30);
+    // 15 frames a second by default: the tracker shows about 16 anyway, and
+    // at 30 the 1080p MJPEG stream, on a USB 2.0 hub shared with the DAC and
+    // the mixer, came in cut short (Corrupt JPEG data: premature end, the
+    // picture's bottom rows smeared). $FACETRACK_FPS sets it.
+    cap.set(cv::CAP_PROP_FPS, getenv("FACETRACK_FPS") ? atoi(getenv("FACETRACK_FPS")) : 15);
     cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
     if (!cap.isOpened()) { std::fprintf(stderr, "facetrack: cannot open %s\n", dev.c_str()); return 1; }
 
@@ -106,11 +151,15 @@ int main(int argc, char** argv) {
     std::printf("YUV4MPEG2 W%d H%d F30:1 Ip A1:1 C420jpeg\n", W, H);
     std::fflush(stdout);
 
-    // detect on a frame scaled to this width, box mapped back
-    const int DW = 480;
+    // detect on a frame scaled to this width, box mapped back (YuNet at 960:
+    // a face across the room is still some 50 px)
+    const int DW = getenv("FACETRACK_DW") ? atoi(getenv("FACETRACK_DW")) : (yunet ? 960 : 480);
     cv::Mat frame, gray, small, i420;
     cv::Rect box; bool have = false; int miss = 0, hits = 0; double ema = 0.4;
     time_t last_snap = 0; long fn = 0;
+    // the status's second: its largest face count and motion, its frames
+    cv::Mat mprev, mcur; int sec_faces = 0, sec_frames = 0; double sec_motion = 0, sec_light = 0;
+    time_t last_status = 0;
     const char* dt = "/usr/share/fonts/TTF/DejaVuSansMono.ttf"; (void)dt;
 
     for (;;) {
@@ -146,20 +195,51 @@ int main(int argc, char** argv) {
         double s = (double)DW / frame.cols;
         cv::resize(frame, small, cv::Size(), s, s, cv::INTER_AREA);
         cv::cvtColor(small, gray, cv::COLOR_BGR2GRAY);
-        cv::UMat ug; gray.copyTo(ug);           // UMat -> detect on the GPU via OpenCL
-        cv::equalizeHist(ug, ug);
         std::vector<cv::Rect> faces;
-        // minNeighbors 6 (was 4): the brightened dark rooms gave noise that a
-        // looser detector called a face.
-        face.detectMultiScale(ug, faces, 1.2, 6, 0, cv::Size(40, 40));
+        if (yunet) {
+            // YuNet: each row x, y, w, h, five landmarks, score; best first
+            // by score here, so the face it is surest of is the one tracked.
+            cv::Mat det;
+            yunet->setInputSize(small.size());
+            yunet->detect(small, det);
+            std::vector<std::pair<float, cv::Rect>> ranked;
+            for (int i = 0; i < det.rows; i++)
+                ranked.push_back({det.at<float>(i, 14), cv::Rect((int)det.at<float>(i, 0), (int)det.at<float>(i, 1),
+                                                                (int)det.at<float>(i, 2), (int)det.at<float>(i, 3))});
+            std::sort(ranked.begin(), ranked.end(), [](auto& a, auto& b) { return a.first > b.first; });
+            for (auto& r : ranked) faces.push_back(r.second);
+        } else {
+            cv::UMat ug; gray.copyTo(ug);           // UMat -> detect on the GPU via OpenCL
+            cv::equalizeHist(ug, ug);
+            // minNeighbors 6 (was 4): the brightened dark rooms gave noise that a
+            // looser detector called a face.
+            face.detectMultiScale(ug, faces, 1.2, 6, 0, cv::Size(40, 40));
+            std::sort(faces.begin(), faces.end(), [](auto& a, auto& b) { return a.area() > b.area(); });
+        }
 
+        const int nfaces = (int)faces.size();
+        // Locked, it stays on its face: the detection nearest the box (its
+        // centre within the box's width of the box's centre), not the best
+        // scored, which jumped between two faces each frame; past that none
+        // counts as a miss, and after the misses the best is taken again.
+        if (have && !faces.empty()) {
+            cv::Point2d bc(box.x + box.width / 2.0, box.y + box.height / 2.0);
+            int pick = -1; double best = 1e18;
+            for (size_t i = 0; i < faces.size(); i++) {
+                const cv::Rect& f = faces[i];
+                cv::Point2d fc((f.x + f.width / 2.0) / s, (f.y + f.height / 2.0) / s);
+                double d = std::hypot(fc.x - bc.x, fc.y - bc.y);
+                if (d < box.width && d < best) { best = d; pick = (int)i; }
+            }
+            if (pick < 0) faces.clear(); else std::swap(faces[0], faces[pick]);
+        }
         if (!faces.empty()) {
             cv::Rect f = faces[0];
-            for (auto& r : faces) if (r.area() > f.area()) f = r;
             cv::Rect det((int)(f.x / s), (int)(f.y / s), (int)(f.width / s), (int)(f.height / s));
-            // Lock only after 3 detections in a row: a one-frame false hit
-            // in the noise never draws the reticle.
-            if (!have) { if (++hits >= 3) { box = det; have = true; } }
+            // Lock only after detections in a row (3 for the cascade, 2 for
+            // YuNet, which seldom fires on noise): a one-frame false hit in
+            // the noise never draws the reticle.
+            if (!have) { if (++hits >= (yunet ? 2 : 3)) { box = det; have = true; } }
             else {   // smooth to kill jitter
                 box.x = (int)(ema * det.x + (1 - ema) * box.x);
                 box.y = (int)(ema * det.y + (1 - ema) * box.y);
@@ -168,6 +248,41 @@ int main(int argc, char** argv) {
             }
             miss = 0;
         } else { hits = 0; if (have && ++miss > 20) have = false; }
+
+        if (!status.empty()) {
+            cv::resize(gray, mcur, cv::Size(96, std::max(1, gray.rows * 96 / std::max(1, gray.cols))), 0, 0, cv::INTER_AREA);
+            if (!mprev.empty() && mprev.size() == mcur.size()) {
+                cv::Mat d; cv::absdiff(mcur, mprev, d);
+                sec_motion = std::max(sec_motion, cv::mean(d)[0] / 255.0);
+            }
+            mcur.copyTo(mprev);
+            sec_light = cv::mean(mcur)[0];
+            sec_faces = std::max(sec_faces, nfaces);
+            sec_frames++;
+            time_t tnow = time(nullptr);
+            if (tnow != last_status) {
+                if (last_status != 0) {
+                    struct timespec tsp; clock_gettime(CLOCK_REALTIME, &tsp);
+                    char line[256];
+                    cv::Rect b = have ? (box & cv::Rect(0, 0, W, H)) : cv::Rect();
+                    std::snprintf(line, sizeof line,
+                        "t=%lld cam=%s faces=%d locked=%d box=%d,%d,%d,%d motion=%.3f light=%d fps=%d\n",
+                        (long long)tsp.tv_sec * 1000000LL + tsp.tv_nsec / 1000, camname.c_str(), sec_faces,
+                        have ? 1 : 0, b.x, b.y, b.width, b.height, sec_motion, (int)sec_light, sec_frames);
+                    std::string tmp = status + ".status.tmp";
+                    if (FILE* f = std::fopen(tmp.c_str(), "w")) {
+                        std::fputs(line, f); std::fclose(f);
+                        std::rename(tmp.c_str(), (status + ".status").c_str());
+                    }
+                    std::string lg = status + ".log";
+                    struct stat stl;
+                    if (stat(lg.c_str(), &stl) == 0 && stl.st_size > 2 * 1024 * 1024)
+                        std::rename(lg.c_str(), (lg + ".1").c_str());
+                    if (FILE* f = std::fopen(lg.c_str(), "a")) { std::fputs(line, f); std::fclose(f); }
+                }
+                last_status = tnow; sec_faces = 0; sec_frames = 0; sec_motion = 0;
+            }
+        }
 
         // The Machine's optical overlay: faint grid, a thin frame.
         {   // grid + frame drawn at low alpha via a blended copy

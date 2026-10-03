@@ -54,7 +54,31 @@ pull() {   # IP TITLE
         sleep 2
     done
 }
+# Each laptop tracker's status line (faces, lock, motion, light; facetrack's
+# FACETRACK_STATUS=/dev/shm/facetrack) copied once a second into the Phi
+# Stream's camera feed ($CAM079_FEEDS/NAME.status, rewritten, and NAME.log,
+# appended), the text its camera monitor reads. Reconnects on its own.
+feeds="${CAM079_FEEDS:-$HOME/.local/share/phi-stream/dev/feeds}"
+mkdir -p "$feeds"
+status_pull() {   # IP NAME
+    while :; do
+        env SSH_ASKPASS="$A" SSH_ASKPASS_REQUIRE=force DISPLAY=:0 \
+            ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no \
+                -o NumberOfPasswordPrompts=1 -o ConnectTimeout=10 \
+                -o ServerAliveInterval=15 -o ServerAliveCountMax=2 -o StrictHostKeyChecking=no "lasimeri@$1" \
+            "bash -c 'while :; do cat /dev/shm/facetrack.status 2>/dev/null; sleep 1; done'" 2>/dev/null |
+            while IFS= read -r line; do
+                [ "$line" = "${last:-}" ] && continue
+                last=$line
+                printf '%s\n' "$line" > "$feeds/$2.status.tmp" && mv "$feeds/$2.status.tmp" "$feeds/$2.status"
+                printf '%s\n' "$line" >> "$feeds/$2.log"
+            done
+        sleep 5
+    done
+}
 pull "${E16_IP:-192.168.0.78}" "079 laptop" &
 pull "${YG6_IP:-192.168.0.125}" "079 bedroom" &
+status_pull "${E16_IP:-192.168.0.78}" laptop &
+status_pull "${YG6_IP:-192.168.0.125}" bedroom &
 ( for t in 2 2 3 5 8; do sleep "$t"; "$here/cam-grid-place"; done ) &
 wait
