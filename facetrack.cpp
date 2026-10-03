@@ -80,7 +80,7 @@ int main(int argc, char** argv) {
     double clip = getenv("FACETRACK_CLAHE") ? atof(getenv("FACETRACK_CLAHE")) : 2.0;
     if (gamma <= 0) gamma = 1.0;
     cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(clip, cv::Size(8, 8));
-    double dn_alpha = getenv("FACETRACK_DENOISE") ? atof(getenv("FACETRACK_DENOISE")) : 0.45;
+    double dn_alpha = getenv("FACETRACK_DENOISE") ? atof(getenv("FACETRACK_DENOISE")) : 1.0;
     if (dn_alpha <= 0 || dn_alpha > 1) dn_alpha = 1.0;
     cv::UMat acc;
     cv::Mat glut(1, 256, CV_8U);
@@ -131,7 +131,9 @@ int main(int argc, char** argv) {
             cv::LUT(uf, glut, uf);
             // Temporal noise reduction: a running average of frames (EMA),
             // which removes the grain the lift brings up in a still dark room
-            // (averaging ~1/alpha frames). FACETRACK_DENOISE=1 turns it off.
+            // (averaging ~1/alpha frames). Off by default: it smears motion
+            // and keeps float frame buffers on the GPU; FACETRACK_DENOISE=0.45
+            // turns it on for a still, dark room.
             if (dn_alpha < 1.0) {
                 cv::UMat f32; uf.convertTo(f32, CV_32FC3);
                 if (acc.empty() || acc.size() != f32.size()) f32.copyTo(acc);

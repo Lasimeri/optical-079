@@ -75,7 +75,7 @@ Run `facetrack` standalone against any camera:
 | `FACETRACK_ENHANCE` | on (`0` = raw picture) | turns the whole lift on or off |
 | `FACETRACK_CLAHE` | `2.0` | CLAHE clip limit on luminance (local contrast; clipped so sensor noise isn't blown up) |
 | `FACETRACK_GAMMA` | `1.3` | gamma lift |
-| `FACETRACK_DENOISE` | `0.45` (`1` = off) | temporal noise reduction (running average of frames): removes the grain the lift brings up in a still dark room |
+| `FACETRACK_DENOISE` | off (`0.45` = on) | temporal noise reduction (running average of frames). Off by default: it smears motion and keeps float frame buffers on the GPU. Turn it on only for a still, dark room |
 
 **False-lock guard:** the reticle only locks after 3 detections in a row, and the detector uses `minNeighbors` 6. Without these, brightened noise in an empty dark room was sometimes taken for a face.
 
