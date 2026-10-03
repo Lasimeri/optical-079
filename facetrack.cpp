@@ -60,6 +60,11 @@ static void reticle(cv::Mat& f, cv::Rect r, cv::Scalar col, int lock) {
 }
 
 int main(int argc, char** argv) {
+    // This OpenCV runs its parallel loops on TBB, which ignores
+    // OPENCV_FOR_THREADS_NUM: 16 workers at 10-20 % each, 362 % in all
+    // (2026-10-03), for loops the GPU does most of the work around. The arena
+    // is set here ($FACETRACK_THREADS, default 2).
+    cv::setNumThreads(getenv("FACETRACK_THREADS") ? atoi(getenv("FACETRACK_THREADS")) : 2);
     std::string dev = argc > 1 ? argv[1] : "/dev/video0";
     int W = argc > 2 ? atoi(argv[2]) : 1280, H = argc > 3 ? atoi(argv[3]) : 720;
     std::string label = argc > 4 ? argv[4] : "SUBJECT: ADMIN";
@@ -153,8 +158,11 @@ int main(int argc, char** argv) {
 
     // detect on a frame scaled to this width, box mapped back (YuNet at 960:
     // a face across the room is still some 50 px)
-    const int DW = getenv("FACETRACK_DW") ? atoi(getenv("FACETRACK_DW")) : (yunet ? 960 : 480);
+    // (on the CPU, without OpenCL, 640: the laptops' YuNet at 960 took 376 %
+    // of a CPU; never wider than the frame itself, which only adds pixels)
+    const int DW = getenv("FACETRACK_DW") ? atoi(getenv("FACETRACK_DW")) : (yunet ? (gpu ? 960 : 640) : 480);
     cv::Mat frame, gray, small, i420;
+    cv::UMat grid;   // the overlay grid, on the GPU
     cv::Rect box; bool have = false; int miss = 0, hits = 0; double ema = 0.4;
     time_t last_snap = 0; long fn = 0;
     // the status's second: its largest face count and motion, its frames
@@ -170,8 +178,13 @@ int main(int argc, char** argv) {
         // CLAHE on the luminance (local contrast, clip-limited so sensor noise
         // is not blown up) and a gamma lift, on the GPU through UMat when
         // OpenCL is on. FACETRACK_ENHANCE=0 shows the raw picture.
+        // The frame stays on the GPU (OpenCL T-API) from here to the HUD: the
+        // lift, the downscale for detection and the grid blend run there; the
+        // CPU decodes, draws the text and reticle, and hands the frame to mpv
+        // (on the CPU these took 373 % of a 16-thread CPU, 2026-10-03).
+        cv::UMat uf; frame.copyTo(uf);
         if (enhance) {
-            cv::UMat uf, lab; frame.copyTo(uf);
+            cv::UMat lab;
             cv::cvtColor(uf, lab, cv::COLOR_BGR2Lab);
             std::vector<cv::UMat> ch; cv::split(lab, ch);
             clahe->apply(ch[0], ch[0]);
@@ -189,11 +202,14 @@ int main(int argc, char** argv) {
                 else cv::accumulateWeighted(f32, acc, dn_alpha);
                 acc.convertTo(uf, CV_8UC3);
             }
-            uf.copyTo(frame);
         }
 
-        double s = (double)DW / frame.cols;
-        cv::resize(frame, small, cv::Size(), s, s, cv::INTER_AREA);
+        double s = (double)std::min(DW, frame.cols) / frame.cols;
+        {
+            cv::UMat usmall;
+            cv::resize(uf, usmall, cv::Size(), s, s, cv::INTER_AREA);
+            usmall.copyTo(small);
+        }
         cv::cvtColor(small, gray, cv::COLOR_BGR2GRAY);
         std::vector<cv::Rect> faces;
         if (yunet) {
@@ -285,11 +301,18 @@ int main(int argc, char** argv) {
         }
 
         // The Machine's optical overlay: faint grid, a thin frame.
-        {   // grid + frame drawn at low alpha via a blended copy
-            cv::Mat ov = frame.clone();
-            for (int x = 80; x < W; x += 80) cv::line(ov, cv::Point(x, 0), cv::Point(x, H), cv::Scalar(255, 255, 255), 1);
-            for (int y = 80; y < H; y += 80) cv::line(ov, cv::Point(0, y), cv::Point(W, y), cv::Scalar(255, 255, 255), 1);
-            cv::addWeighted(ov, 0.06, frame, 0.94, 0, frame);
+        // The grid is drawn once and added faintly on the GPU (it was a full
+        // copy of the frame and a CPU blend every frame); the frame comes
+        // down once for the text and the reticle.
+        {
+            if (grid.empty() || grid.size() != uf.size()) {
+                cv::Mat g(uf.size(), CV_8UC3, cv::Scalar::all(0));
+                for (int x = 80; x < W; x += 80) cv::line(g, cv::Point(x, 0), cv::Point(x, H), cv::Scalar(255, 255, 255), 1);
+                for (int y = 80; y < H; y += 80) cv::line(g, cv::Point(0, y), cv::Point(W, y), cv::Scalar(255, 255, 255), 1);
+                g.copyTo(grid);
+            }
+            cv::addWeighted(uf, 1.0, grid, 0.06, 0, uf);
+            uf.copyTo(frame);
             cv::rectangle(frame, cv::Rect(1, 1, W - 2, H - 2), cv::Scalar(255, 255, 255), 2, cv::LINE_AA);
         }
         // HUD: timestamp top, label bottom (yellow), tracking state
