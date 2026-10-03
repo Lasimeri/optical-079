@@ -65,3 +65,31 @@ Run `facetrack` standalone against any camera:
 ## Credits
 
 `shaders/FSR.glsl` is AMD's FidelityFX Super Resolution, MIT licensed, Copyright (c) Advanced Micro Devices, Inc. The rest of this repository is under the MIT license (see `LICENSE`).
+
+## Picture enhancement (dark rooms)
+
+`facetrack` lifts dark scenes before it detects faces, so both the picture and the tracking improve. It runs on the GPU through `cv::UMat` when OpenCL is available.
+
+| Setting | Default | What it does |
+| --- | --- | --- |
+| `FACETRACK_ENHANCE` | on (`0` = raw picture) | turns the whole lift on or off |
+| `FACETRACK_CLAHE` | `2.0` | CLAHE clip limit on luminance (local contrast; clipped so sensor noise isn't blown up) |
+| `FACETRACK_GAMMA` | `1.3` | gamma lift |
+| `FACETRACK_DENOISE` | `0.45` (`1` = off) | temporal noise reduction (running average of frames): removes the grain the lift brings up in a still dark room |
+
+**False-lock guard:** the reticle only locks after 3 detections in a row, and the detector uses `minNeighbors` 6. Without these, brightened noise in an empty dark room was sometimes taken for a face.
+
+## Remote laptops in a 2x2 grid
+
+Show other machines' cameras beside the desktop's own:
+
+1. **On each laptop**, copy `facetrack.cpp` and `laptop/` over and build `facetrack`. Run `laptop/facetrack.sh`, or install `laptop/facetrack.desktop` into `~/.config/autostart` (edit its path) to start at login. Besides its own window, the laptop publishes every second annotated frame to `/dev/shm/facetrack.jpg` (`FACETRACK_STREAM`), written to a temporary name and renamed into place, so a reader never sees half a file.
+2. **On the desktop**, `lapcams.sh` pulls each laptop's frames over SSH as a live MJPEG stream into a window ("079 laptop", "079 bedroom"). It reconnects on its own and uses the same GPU scalers and FSR as the desktop cameras. Set laptop addresses with `E16_IP` / `YG6_IP`. The password comes from a private file, as in voice-079 (`LAPTOP_SSH_PASS_FILE`).
+3. `cam-grid-place` lays out all four on the camera screen: inside top-left, outside top-right, laptop bottom-left, bedroom bottom-right. 4:3 feeds get a 4:3 window centred in their cell. `cam079` defers to the grid when `$XDG_RUNTIME_DIR/speak-079/camgrid` exists, which `lapcams.sh` creates.
+
+Stop the laptop feeds with `kill -- -$(cat $XDG_RUNTIME_DIR/speak-079/lapcams.pid)`.
+
+## Robustness
+
+- `cam079 split` runs with only one camera. The outside camera joins on its own when plugged in, and its night exposure is re-applied on every (re)start, so a replugged camera doesn't come back on auto exposure.
+- Camera device numbers can change when a webcam resets on USB. The runners find cameras by capability each time they (re)start, not by fixed `/dev/videoN` paths.

@@ -14,6 +14,7 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/videoio.hpp>
 #include <opencv2/xobjdetect.hpp>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -62,6 +63,28 @@ int main(int argc, char** argv) {
     const char* snapenv = getenv("FACETRACK_SNAP");
     std::string snap = snapenv ? std::string(snapenv)
                                : std::string(home ? home : ".") + "/.cache/lapcam/latest.jpg";
+    // $FACETRACK_STREAM: every second annotated frame also written there as a
+    // JPEG (to a temp name, then renamed, so a reader never sees half a file);
+    // another machine can pull it as a live MJPEG feed without opening the
+    // camera a second time.
+    const char* streamenv = getenv("FACETRACK_STREAM");
+    std::string stream = streamenv ? streamenv : "";
+    std::string stream_tmp = stream + ".tmp.jpg";
+    std::vector<int> jq = {cv::IMWRITE_JPEG_QUALITY, 80};
+    // Picture enhancement settings: FACETRACK_ENHANCE (default on),
+    // FACETRACK_GAMMA (default 1.3, the old "admin" look), FACETRACK_CLAHE
+    // (clip limit, default 2.0).
+    const char* en = getenv("FACETRACK_ENHANCE");
+    bool enhance = !(en && en[0] == '0');
+    double gamma = getenv("FACETRACK_GAMMA") ? atof(getenv("FACETRACK_GAMMA")) : 1.3;
+    double clip = getenv("FACETRACK_CLAHE") ? atof(getenv("FACETRACK_CLAHE")) : 2.0;
+    if (gamma <= 0) gamma = 1.0;
+    cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(clip, cv::Size(8, 8));
+    double dn_alpha = getenv("FACETRACK_DENOISE") ? atof(getenv("FACETRACK_DENOISE")) : 0.45;
+    if (dn_alpha <= 0 || dn_alpha > 1) dn_alpha = 1.0;
+    cv::UMat acc;
+    cv::Mat glut(1, 256, CV_8U);
+    for (int i = 0; i < 256; i++) glut.at<uchar>(i) = cv::saturate_cast<uchar>(255.0 * std::pow(i / 255.0, 1.0 / gamma));
 
     cv::ocl::setUseOpenCL(true);
     bool gpu = cv::ocl::useOpenCL();
@@ -86,7 +109,7 @@ int main(int argc, char** argv) {
     // detect on a frame scaled to this width, box mapped back
     const int DW = 480;
     cv::Mat frame, gray, small, i420;
-    cv::Rect box; bool have = false; int miss = 0; double ema = 0.4;
+    cv::Rect box; bool have = false; int miss = 0, hits = 0; double ema = 0.4;
     time_t last_snap = 0; long fn = 0;
     const char* dt = "/usr/share/fonts/TTF/DejaVuSansMono.ttf"; (void)dt;
 
@@ -94,19 +117,47 @@ int main(int argc, char** argv) {
         if (!cap.read(frame) || frame.empty()) { if (++miss > 300) break; usleep(10000); continue; }
         if (frame.cols != W || frame.rows != H) { W = frame.cols; H = frame.rows; }
 
+        // Low-light lift, before detection so the tracker sees better too:
+        // CLAHE on the luminance (local contrast, clip-limited so sensor noise
+        // is not blown up) and a gamma lift, on the GPU through UMat when
+        // OpenCL is on. FACETRACK_ENHANCE=0 shows the raw picture.
+        if (enhance) {
+            cv::UMat uf, lab; frame.copyTo(uf);
+            cv::cvtColor(uf, lab, cv::COLOR_BGR2Lab);
+            std::vector<cv::UMat> ch; cv::split(lab, ch);
+            clahe->apply(ch[0], ch[0]);
+            cv::merge(ch, lab);
+            cv::cvtColor(lab, uf, cv::COLOR_Lab2BGR);
+            cv::LUT(uf, glut, uf);
+            // Temporal noise reduction: a running average of frames (EMA),
+            // which removes the grain the lift brings up in a still dark room
+            // (averaging ~1/alpha frames). FACETRACK_DENOISE=1 turns it off.
+            if (dn_alpha < 1.0) {
+                cv::UMat f32; uf.convertTo(f32, CV_32FC3);
+                if (acc.empty() || acc.size() != f32.size()) f32.copyTo(acc);
+                else cv::accumulateWeighted(f32, acc, dn_alpha);
+                acc.convertTo(uf, CV_8UC3);
+            }
+            uf.copyTo(frame);
+        }
+
         double s = (double)DW / frame.cols;
         cv::resize(frame, small, cv::Size(), s, s, cv::INTER_AREA);
         cv::cvtColor(small, gray, cv::COLOR_BGR2GRAY);
         cv::UMat ug; gray.copyTo(ug);           // UMat -> detect on the GPU via OpenCL
         cv::equalizeHist(ug, ug);
         std::vector<cv::Rect> faces;
-        face.detectMultiScale(ug, faces, 1.2, 4, 0, cv::Size(40, 40));
+        // minNeighbors 6 (was 4): the brightened dark rooms gave noise that a
+        // looser detector called a face.
+        face.detectMultiScale(ug, faces, 1.2, 6, 0, cv::Size(40, 40));
 
         if (!faces.empty()) {
             cv::Rect f = faces[0];
             for (auto& r : faces) if (r.area() > f.area()) f = r;
             cv::Rect det((int)(f.x / s), (int)(f.y / s), (int)(f.width / s), (int)(f.height / s));
-            if (!have) { box = det; have = true; }
+            // Lock only after 3 detections in a row: a one-frame false hit
+            // in the noise never draws the reticle.
+            if (!have) { if (++hits >= 3) { box = det; have = true; } }
             else {   // smooth to kill jitter
                 box.x = (int)(ema * det.x + (1 - ema) * box.x);
                 box.y = (int)(ema * det.y + (1 - ema) * box.y);
@@ -114,7 +165,7 @@ int main(int argc, char** argv) {
                 box.height = (int)(ema * det.height + (1 - ema) * box.height);
             }
             miss = 0;
-        } else if (have && ++miss > 20) { have = false; }
+        } else { hits = 0; if (have && ++miss > 20) have = false; }
 
         // The Machine's optical overlay: faint grid, a thin frame.
         {   // grid + frame drawn at low alpha via a blended copy
@@ -138,8 +189,11 @@ int main(int argc, char** argv) {
         cv::putText(frame, st, cv::Point(W - sz.width - 24, H - 22), cv::FONT_HERSHEY_SIMPLEX, 0.6, have ? cv::Scalar(255, 255, 255) : cv::Scalar(120, 120, 120), 1, cv::LINE_AA);
         if (have) reticle(frame, box & cv::Rect(0, 0, W, H), cv::Scalar(255, 255, 255), 1);
 
-        // newest frame for Claude, ~2/s
+        // newest frame for Claude, ~1/s
         if (now != last_snap) { last_snap = now; cv::imwrite(snap, frame); }
+        // the live feed for another machine
+        if (!stream.empty() && (fn % 2) == 0 && cv::imwrite(stream_tmp, frame, jq))
+            std::rename(stream_tmp.c_str(), stream.c_str());
 
         // out as I420 y4m
         cv::cvtColor(frame, i420, cv::COLOR_BGR2YUV_I420);

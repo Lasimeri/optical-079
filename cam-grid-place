@@ -1,0 +1,31 @@
+#!/bin/bash
+# cam-grid-place: the four camera windows in a 2x2 grid on the camera screen
+# (CAM079_SCREEN, default DP-2): "079 inside" top left, "079 outside" top
+# right, "079 laptop" bottom left, "079 bedroom" bottom right. Each window
+# fills its cell and mpv keeps the picture's aspect inside it. Used by cam079
+# (when $XDG_RUNTIME_DIR/speak-079/camgrid exists) and by lapcams.sh.
+set -u
+geo=$(kscreen-doctor -o 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' |
+    awk -v s="${CAM079_SCREEN:-DP-2}" '$1 == "Output:" { on = ($3 == s) } on && $1 == "Geometry:" { print $2, $3; exit }')
+[ -n "$geo" ] || exit 0
+sx=${geo%%,*}; sy=${geo#*,}; sy=${sy%% *}; sw=${geo##* }; sh=${sw#*x}; sw=${sw%x*}
+cw=$(( sw / 2 )); ch=$(( sh / 2 ))
+# 16:9 feeds fill the cell; 4:3 feeds (the outside camera, 1280x960, and the
+# bedroom laptop, 640x480) get a 4:3 window centred in theirs, else mpv grows
+# the window to keep the aspect and it spills into the row below.
+w43=$(( ch * 4 / 3 )); [ "$w43" -gt "$cw" ] && w43=$cw
+o43=$(( (cw - w43) / 2 ))
+js="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/speak-079/grid.js"
+cat > "$js" <<EOF
+var ws = workspace.windowList();
+var cells = {"079 inside": [$sx, $sy, $cw], "079 outside": [$sx + $cw + $o43, $sy, $w43],
+             "079 laptop": [$sx, $sy + $ch, $cw], "079 bedroom": [$sx + $cw + $o43, $sy + $ch, $w43]};
+for (var i = 0; i < ws.length; i++) {
+    var p = cells[ws[i].caption];
+    if (p) { ws[i].noBorder = true; ws[i].keepAbove = true; ws[i].frameGeometry = {x: p[0], y: p[1], width: p[2], height: $ch}; }
+}
+EOF
+id=$(qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.loadScript "$js" cam079grid 2>/dev/null)
+[ -n "$id" ] && qdbus6 org.kde.KWin "/Scripting/Script$id" org.kde.kwin.Script.run > /dev/null 2>&1
+qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript cam079grid > /dev/null 2>&1
+exit 0

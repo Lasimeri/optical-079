@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=079 face-tracking camera
+Exec=/home/YOU/optical-079/laptop/facetrack-boot.sh
+X-KDE-autostart-phase=2
+NoDisplay=true

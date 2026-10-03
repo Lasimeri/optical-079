@@ -89,6 +89,13 @@ case "${1:-}" in
                 read -r d size fps <<< "$(find_cam)"
                 [ "$side" = outside ] && { d=$(other_cam "$d"); size=1280x960; fps=30; }
                 if [ -z "$d" ]; then sleep 1; continue; fi
+                # Night exposure for the outside camera, set each time it starts
+                # (a replugged camera comes back on its default auto exposure).
+                if [ "$side" = outside ] && [ "$style" = night ]; then
+                    local gmax
+                    gmax=$(v4l2-ctl -d "$d" --list-ctrls 2>/dev/null | awk '$1 == "gain" {for (i = 1; i <= NF; i++) if ($i ~ /^max=/) print substr($i, 5)}')
+                    v4l2-ctl -d "$d" -c auto_exposure=1 -c exposure_time_absolute=2000 -c gain=$(( ${gmax:-255} * 4 / 5 )) 2>/dev/null
+                fi
                 local g n p
                 if [ "$side" = inside ] && [ -x "$here/facetrack" ] && [ "${CAM079_TRACK:-1}" != 0 ]; then
                     # The inside camera through facetrack: OpenCV face detection
@@ -126,6 +133,10 @@ case "${1:-}" in
         # right, at one height that fills the width, centred, kept above.
         _split_place() {
             local geo sx sy sw sh h wi wo js id
+            # With the laptops' feeds up (lapcams.sh), all four share a 2x2 grid.
+            if [ -e "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/speak-079/camgrid" ]; then
+                "$here/cam-grid-place"; return
+            fi
             geo=$(kscreen-doctor -o 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' |
                 awk -v s="${CAM079_SCREEN:-DP-2}" '$1 == "Output:" { on = ($3 == s) } on && $1 == "Geometry:" { print $2, $3; exit }')
             [ -n "$geo" ] || return
@@ -173,10 +184,11 @@ EOF
         # Both cameras at once (inside: the best one; outside: the other).
         "$0" stop > /dev/null
         o=$(other_cam "$dev")
-        [ -n "$o" ] || { echo "cam079: only one camera" >&2; exit 1; }
-        gmax=$(v4l2-ctl -d "$o" --list-ctrls 2>/dev/null | awk '$1 == "gain" {for (i = 1; i <= NF; i++) if ($i ~ /^max=/) print substr($i, 5)}')
-        [ "${CAM079_OUTSIDE:-night}" = night ] && v4l2-ctl -d "$o" -c auto_exposure=1 -c exposure_time_absolute=2000 -c gain=$(( ${gmax:-255} * 4 / 5 )) 2>/dev/null
-        for _ in 1 2 3 4 5 6 7 8 9 10; do fuser "$dev" "$o" > /dev/null 2>&1 || break; sleep 0.2; done
+        # The outside camera may be unplugged: the inside one runs anyway and
+        # the outside loop picks its camera up when it is plugged back in
+        # (its night exposure is set there, on every (re)start).
+        [ -n "$o" ] || echo "cam079: outside camera not connected; inside runs, outside joins when plugged in" >&2
+        for _ in 1 2 3 4 5 6 7 8 9 10; do fuser "$dev" ${o:+"$o"} > /dev/null 2>&1 || break; sleep 0.2; done
         setsid "$0" _split > "$dir/cam.log" 2>&1 < /dev/null &
         echo $! > "$pidf"
         echo "cam079: both cameras ($dev inside, $o outside)"
