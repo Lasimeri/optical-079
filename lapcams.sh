@@ -62,14 +62,30 @@ feeds="${CAM079_FEEDS:-$HOME/.local/share/phi-stream/dev/feeds}"
 mkdir -p "$feeds"
 status_pull() {   # IP NAME
     while :; do
+        # The media check (laptop-media-status.sh) copied over on each connect.
+        env SSH_ASKPASS="$A" SSH_ASKPASS_REQUIRE=force DISPLAY=:0 \
+            ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no \
+                -o NumberOfPasswordPrompts=1 -o ConnectTimeout=10 -o StrictHostKeyChecking=no "lasimeri@$1" \
+            "mkdir -p ~/.cache/lapcam; cat > ~/.cache/lapcam/media.sh" < "$here/laptop-media-status.sh" 2>/dev/null
         env SSH_ASKPASS="$A" SSH_ASKPASS_REQUIRE=force DISPLAY=:0 \
             ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no \
                 -o NumberOfPasswordPrompts=1 -o ConnectTimeout=10 \
                 -o ServerAliveInterval=15 -o ServerAliveCountMax=2 -o StrictHostKeyChecking=no "lasimeri@$1" \
-            "bash -c 'while :; do cat /dev/shm/facetrack.status /dev/shm/mic.status 2>/dev/null; sleep 1; done'" 2>/dev/null |
+            "bash -c 'while :; do cat /dev/shm/facetrack.status /dev/shm/mic.status 2>/dev/null; bash ~/.cache/lapcam/media.sh $2 2>/dev/null; sleep 1; done'" 2>/dev/null |
             while IFS= read -r line; do
-                # The camera's line goes to NAME, the voice detector's (mic=) to mic-NAME.
-                case "$line" in *" mic="*) f="mic-$2"; prev=${lastm:-}; lastm=$line ;; *) f="$2"; prev=${last:-}; last=$line ;; esac
+                # The camera's line goes to NAME, the voice detector's (mic=) to
+                # mic-NAME, the media check's (media=) to media-NAME: its status
+                # rewritten every second (the listener wants it fresh), its log
+                # only when what plays changes.
+                case "$line" in
+                    *" media="*)
+                        printf '%s\n' "$line" > "$feeds/media-$2.status.tmp" && mv "$feeds/media-$2.status.tmp" "$feeds/media-$2.status"
+                        [ "${line#* }" = "${lastp:-}" ] || printf '%s\n' "$line" >> "$feeds/media-$2.log"
+                        lastp=${line#* }
+                        continue ;;
+                    *" mic="*) f="mic-$2"; prev=${lastm:-}; lastm=$line ;;
+                    *) f="$2"; prev=${last:-}; last=$line ;;
+                esac
                 [ "$line" = "$prev" ] && continue
                 printf '%s\n' "$line" > "$feeds/$f.status.tmp" && mv "$feeds/$f.status.tmp" "$feeds/$f.status"
                 printf '%s\n' "$line" >> "$feeds/$f.log"
