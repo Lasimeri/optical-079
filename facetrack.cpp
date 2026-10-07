@@ -5,7 +5,8 @@
 // window, and the newest frame is kept as latest.jpg for Claude.
 //
 //   facetrack [DEVICE] [W] [H] [LABEL]
-// DEVICE default /dev/video0, W H default 1280x720, LABEL default
+// DEVICE default /dev/video0 ("-": raw BGR frames on stdin, a remote camera
+// decoded here, the Glass's), W H default 1280x720, LABEL default
 // "SUBJECT: ADMIN". The snapshot path is $FACETRACK_SNAP, default
 // ~/.cache/lapcam/latest.jpg. Build: see facetrack.sh.
 #include <opencv2/core.hpp>
@@ -24,7 +25,11 @@
 #include <ctime>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <cerrno>
 #include <algorithm>
+#include <array>
+#include "faceid.h"
 
 static std::string cascade_path() {
     const char* c[] = {
@@ -37,7 +42,7 @@ static std::string cascade_path() {
 
 // A Machine-style corner bracket at (x,y,w,h): four L corners, a thin frame,
 // a centre crosshair. White for the admin (friendly), as the analog interface.
-static void reticle(cv::Mat& f, cv::Rect r, cv::Scalar col, int lock) {
+static void reticle(cv::Mat& f, cv::Rect r, cv::Scalar col, const char* tag) {
     int a = std::max(10, r.width / 5), t = 2;
     cv::Point tl(r.x, r.y), tr(r.x + r.width, r.y), bl(r.x, r.y + r.height), br(r.x + r.width, r.y + r.height);
     // thin full frame, faint
@@ -53,10 +58,10 @@ static void reticle(cv::Mat& f, cv::Rect r, cv::Scalar col, int lock) {
     cv::line(f, c - cv::Point(0, 9), c + cv::Point(0, 9), col, 1, cv::LINE_AA);
     // label
     char buf[64];
-    std::snprintf(buf, sizeof buf, "ADMIN  %d,%d", c.x, c.y);
+    std::snprintf(buf, sizeof buf, "%s  %d,%d", tag, c.x, c.y);
     cv::putText(f, buf, cv::Point(r.x, r.y - 8), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 3, cv::LINE_AA);
     cv::putText(f, buf, cv::Point(r.x, r.y - 8), cv::FONT_HERSHEY_SIMPLEX, 0.5, col, 1, cv::LINE_AA);
-    (void)lock;
+
 }
 
 int main(int argc, char** argv) {
@@ -136,21 +141,83 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "facetrack: YuNet %s, score >= %.2f\n", model.c_str(), min_score);
     }
+    // Who the locked face is (faceid.h, in C): SFace's embedding, from the
+    // five landmarks YuNet gives, against the gallery faceid enroll builds.
+    // $FACETRACK_ID_MODEL names it (default: models/ beside this program);
+    // without it, or with the cascade (no landmarks), every face is ADMIN
+    // as before. Recognised about twice a second, and at once on a new lock.
+    static faceid_gallery gallery;
+    faceid_net* fid = nullptr;
+    {
+        std::string idm = getenv("FACETRACK_ID_MODEL") ? getenv("FACETRACK_ID_MODEL")
+                        : exe_dir + "/models/face_recognition_sface_2021dec.onnx";
+        if (yunet && access(idm.c_str(), R_OK) == 0) {
+            char err[512];
+            fid = faceid_net_open(idm.c_str(), 1, err, sizeof err);
+            if (fid) {
+                faceid_load(&gallery, nullptr);
+                std::fprintf(stderr, "facetrack: SFace on %s, %d %s known (%s)\n", faceid_net_where(fid), gallery.people,
+                             gallery.people == 1 ? "person" : "people", gallery.dir);
+            } else std::fprintf(stderr, "facetrack: SFace not loaded: %s\n", err);
+        }
+    }
+    // $FACETRACK_ONLY: only these people may be locked (names, comma
+    // separated; the desktop camera's is "admin", the user's choice,
+    // 2026-10-07: "only lock onto me"). No reticle on anyone else, a face on
+    // a poster included. Needs the identity model and one of them enrolled;
+    // otherwise any face, as before.
+    const char* only = getenv("FACETRACK_ONLY");
+    if (only && !*only) only = nullptr;
+    // The bar for "it is them" when it decides the lock: stricter than SFace's
+    // 0.363 for a label. Measured 2026-10-07: the user 0.55 to 0.85, people on
+    // the TV up to 0.37 (one passed 0.363 for a second). $FACETRACK_ONLY_MIN.
+    const float only_min = getenv("FACETRACK_ONLY_MIN") ? (float)atof(getenv("FACETRACK_ONLY_MIN")) : 0.45f;
+    if (only && !fid) std::fprintf(stderr, "facetrack: FACETRACK_ONLY=%s needs the identity model: any face is locked\n", only);
     cv::CascadeClassifier face;
     std::string cp = cascade_path();
     if (!yunet && (cp.empty() || !face.load(cp))) { std::fprintf(stderr, "facetrack: no detector\n"); return 1; }
 
-    cv::VideoCapture cap(dev, cv::CAP_V4L2);
-    cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
-    cap.set(cv::CAP_PROP_FRAME_WIDTH, W);
-    cap.set(cv::CAP_PROP_FRAME_HEIGHT, H);
-    // 15 frames a second by default: the tracker shows about 16 anyway, and
-    // at 30 the 1080p MJPEG stream, on a USB 2.0 hub shared with the DAC and
-    // the mixer, came in cut short (Corrupt JPEG data: premature end, the
-    // picture's bottom rows smeared). $FACETRACK_FPS sets it.
-    cap.set(cv::CAP_PROP_FPS, getenv("FACETRACK_FPS") ? atoi(getenv("FACETRACK_FPS")) : 15);
-    cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
-    if (!cap.isOpened()) { std::fprintf(stderr, "facetrack: cannot open %s\n", dev.c_str()); return 1; }
+    // DEVICE "-": raw BGR frames (W x H, 3 bytes a pixel) on stdin instead
+    // of a V4L2 camera, for a camera that is not on this machine and is
+    // decoded here: the Google Glass's (glass-xec scripts/glass-camera.sh:
+    // its H.264 decoded by the 3090 Ti's video decoder into bgr24). Only the
+    // newest frame waiting is taken, as the cameras' one-frame buffer does,
+    // so a slow pass never builds up delay.
+    bool from_stdin = dev == "-";
+    cv::VideoCapture cap;
+    if (!from_stdin) {
+        cap.open(dev, cv::CAP_V4L2);
+        cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
+        cap.set(cv::CAP_PROP_FRAME_WIDTH, W);
+        cap.set(cv::CAP_PROP_FRAME_HEIGHT, H);
+        // 15 frames a second by default: the tracker shows about 16 anyway, and
+        // at 30 the 1080p MJPEG stream, on a USB 2.0 hub shared with the DAC and
+        // the mixer, came in cut short (Corrupt JPEG data: premature end, the
+        // picture's bottom rows smeared). $FACETRACK_FPS sets it.
+        cap.set(cv::CAP_PROP_FPS, getenv("FACETRACK_FPS") ? atoi(getenv("FACETRACK_FPS")) : 15);
+        cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
+        if (!cap.isOpened()) { std::fprintf(stderr, "facetrack: cannot open %s\n", dev.c_str()); return 1; }
+    }
+    auto read_all = [](unsigned char* p, size_t need) -> bool {
+        size_t got = 0;
+        while (got < need) {
+            ssize_t n = read(0, p + got, need - got);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) return false;
+            got += (size_t)n;
+        }
+        return true;
+    };
+    auto grab = [&](cv::Mat& f) -> bool {
+        if (!from_stdin) return cap.read(f) && !f.empty();
+        f.create(H, W, CV_8UC3);
+        size_t need = (size_t)W * H * 3;
+        if (!read_all(f.data, need)) return false;
+        int waiting = 0;
+        while (ioctl(0, FIONREAD, &waiting) == 0 && (size_t)waiting >= need)
+            if (!read_all(f.data, need)) return false;   // a newer one is there: that one
+        return true;
+    };
 
     // YUV4MPEG2 header for mpv.
     std::printf("YUV4MPEG2 W%d H%d F30:1 Ip A1:1 C420jpeg\n", W, H);
@@ -165,13 +232,17 @@ int main(int argc, char** argv) {
     cv::UMat grid;   // the overlay grid, on the GPU
     cv::Rect box; bool have = false; int miss = 0, hits = 0; double ema = 0.4;
     time_t last_snap = 0; long fn = 0;
+    // who the locked face is (fid): the name, its similarity, when to look again
+    std::string who; float who_score = -1; double id_next = 0; bool was_have = false, id_done = false;
+    int bigger = 0;   // frames in a row with a face twice the locked one's size elsewhere
+    double scan_next = 0; int strikes = 0;   // FACETRACK_ONLY: the next look at the faces, failed checks of the lock
     // the status's second: its largest face count and motion, its frames
     cv::Mat mprev, mcur; int sec_faces = 0, sec_frames = 0; double sec_motion = 0, sec_light = 0;
     time_t last_status = 0;
     const char* dt = "/usr/share/fonts/TTF/DejaVuSansMono.ttf"; (void)dt;
 
     for (;;) {
-        if (!cap.read(frame) || frame.empty()) { if (++miss > 300) break; usleep(10000); continue; }
+        if (!grab(frame)) { if (from_stdin) break; if (++miss > 300) break; usleep(10000); continue; }
         if (frame.cols != W || frame.rows != H) { W = frame.cols; H = frame.rows; }
 
         // Low-light lift, before detection so the tracker sees better too:
@@ -212,18 +283,26 @@ int main(int argc, char** argv) {
         }
         cv::cvtColor(small, gray, cv::COLOR_BGR2GRAY);
         std::vector<cv::Rect> faces;
+        std::vector<std::array<float, 10>> lms;   // with YuNet: each face's landmarks, same order
         if (yunet) {
             // YuNet: each row x, y, w, h, five landmarks, score; best first
             // by score here, so the face it is surest of is the one tracked.
             cv::Mat det;
             yunet->setInputSize(small.size());
             yunet->detect(small, det);
-            std::vector<std::pair<float, cv::Rect>> ranked;
-            for (int i = 0; i < det.rows; i++)
-                ranked.push_back({det.at<float>(i, 14), cv::Rect((int)det.at<float>(i, 0), (int)det.at<float>(i, 1),
-                                                                (int)det.at<float>(i, 2), (int)det.at<float>(i, 3))});
+            std::vector<std::pair<float, int>> ranked;
+            // largest first: the person at the camera, not the surest small
+            // face on a poster or a screen behind
+            for (int i = 0; i < det.rows; i++) ranked.push_back({det.at<float>(i, 2) * det.at<float>(i, 3), i});
             std::sort(ranked.begin(), ranked.end(), [](auto& a, auto& b) { return a.first > b.first; });
-            for (auto& r : ranked) faces.push_back(r.second);
+            for (auto& r : ranked) {
+                int i = r.second;
+                faces.push_back(cv::Rect((int)det.at<float>(i, 0), (int)det.at<float>(i, 1),
+                                         (int)det.at<float>(i, 2), (int)det.at<float>(i, 3)));
+                std::array<float, 10> l;   // the five landmarks, in the small picture's pixels
+                for (int k = 0; k < 10; k++) l[k] = det.at<float>(i, 4 + k);
+                lms.push_back(l);
+            }
         } else {
             cv::UMat ug; gray.copyTo(ug);           // UMat -> detect on the GPU via OpenCL
             cv::equalizeHist(ug, ug);
@@ -234,10 +313,63 @@ int main(int argc, char** argv) {
         }
 
         const int nfaces = (int)faces.size();
+        // Only the allowed may be locked (FACETRACK_ONLY, one of them
+        // enrolled): unlocked, the faces in view are identified four times
+        // a second, largest first (at most four), and the first allowed one
+        // is locked at once; nothing else is. The largest face's embedding
+        // is published on the way, so faceid enroll works with nobody
+        // locked.
+        struct timespec tq; clock_gettime(CLOCK_MONOTONIC, &tq);
+        const double tframe = tq.tv_sec + tq.tv_nsec / 1e9;
+        bool only_on = false;
+        if (only && fid)
+            for (int i = 0; i < gallery.people && !only_on; i++) only_on = faceid_allowed(only, gallery.p[i].name);
+        if (only_on && !have) {
+            int found = -1;
+            if (tframe >= scan_next && !faces.empty() && lms.size() == faces.size()) {
+                scan_next = tframe + 0.25;
+                faceid_refresh(&gallery);
+                for (size_t i = 0; i < faces.size() && i < 4 && found < 0; i++) {
+                    float lm[10], e[FACEID_DIM], sc = -1;
+                    for (int k = 0; k < 10; k++) lm[k] = (float)(lms[i][k] / s);
+                    if (faceid_embed(fid, frame.data, frame.cols, frame.rows, (int)frame.step[0], lm, e) != 0) continue;
+                    if (i == 0) {
+                        struct timespec tr; clock_gettime(CLOCK_REALTIME, &tr);
+                        faceid_publish(camname.c_str(), e, (long long)tr.tv_sec * 1000000LL + tr.tv_nsec / 1000, nfaces, 1);
+                    }
+                    const char* n = faceid_match(&gallery, e, &sc);
+                    if (n && faceid_allowed(only, n) && sc >= only_min) { found = (int)i; who = n; who_score = sc; }
+                }
+            }
+            if (found >= 0) {
+                std::swap(faces[0], faces[found]);
+                std::swap(lms[0], lms[found]);
+                const cv::Rect& f = faces[0];
+                box = cv::Rect((int)(f.x / s), (int)(f.y / s), (int)(f.width / s), (int)(f.height / s));
+                have = true; was_have = true; id_done = true; id_next = tframe + 0.5;
+                strikes = 0; hits = 0; miss = 0;
+            } else { faces.clear(); lms.clear(); }
+        }
         // Locked, it stays on its face: the detection nearest the box (its
         // centre within the box's width of the box's centre), not the best
         // scored, which jumped between two faces each frame; past that none
         // counts as a miss, and after the misses the best is taken again.
+        // A face at least twice the locked one's size, elsewhere, for 8
+        // frames in a row takes the lock: the person back at the camera
+        // over a face on a poster (the Moon on the wall held the lock once
+        // the person had left, and being still, never let go: 2026-10-07).
+        if (!only_on && have && !faces.empty()) {   // (with FACETRACK_ONLY the lock is only ever on the allowed)
+            const cv::Rect& g = faces[0];   // the largest (ranked so)
+            cv::Point2d gc((g.x + g.width / 2.0) / s, (g.y + g.height / 2.0) / s);
+            cv::Point2d bc0(box.x + box.width / 2.0, box.y + box.height / 2.0);
+            bool elsewhere = std::hypot(gc.x - bc0.x, gc.y - bc0.y) >= box.width;
+            if (elsewhere && (double)g.area() / (s * s) >= 2.0 * box.area()) bigger++;
+            else bigger = 0;
+            if (bigger >= 8) {
+                box = cv::Rect((int)(g.x / s), (int)(g.y / s), (int)(g.width / s), (int)(g.height / s));
+                bigger = 0; id_next = 0; id_done = false; who.clear();
+            }
+        }
         if (have && !faces.empty()) {
             cv::Point2d bc(box.x + box.width / 2.0, box.y + box.height / 2.0);
             int pick = -1; double best = 1e18;
@@ -247,7 +379,8 @@ int main(int argc, char** argv) {
                 double d = std::hypot(fc.x - bc.x, fc.y - bc.y);
                 if (d < box.width && d < best) { best = d; pick = (int)i; }
             }
-            if (pick < 0) faces.clear(); else std::swap(faces[0], faces[pick]);
+            if (pick < 0) { faces.clear(); lms.clear(); }
+            else { std::swap(faces[0], faces[pick]); if (lms.size() == faces.size()) std::swap(lms[0], lms[pick]); }
         }
         if (!faces.empty()) {
             cv::Rect f = faces[0];
@@ -264,6 +397,38 @@ int main(int argc, char** argv) {
             }
             miss = 0;
         } else { hits = 0; if (have && ++miss > 20) have = false; }
+
+        // Who it is: the locked face (faces[0] while seen) twice a second,
+        // and at once on a new lock. Its embedding is published for faceid
+        // enroll, then matched; the gallery is read again when it changes.
+        if (fid) {
+            struct timespec tn; clock_gettime(CLOCK_MONOTONIC, &tn);
+            double tnow = tn.tv_sec + tn.tv_nsec / 1e9;
+            if (have && !was_have) { id_next = 0; id_done = false; who.clear(); }
+            if (!have) id_done = false;
+            if (have && !faces.empty() && lms.size() == faces.size() && tnow >= id_next) {
+                float lm[10], e[FACEID_DIM];
+                for (int k = 0; k < 10; k++) lm[k] = (float)(lms[0][k] / s);
+                if (faceid_embed(fid, frame.data, frame.cols, frame.rows, (int)frame.step[0], lm, e) == 0) {
+                    struct timespec tr; clock_gettime(CLOCK_REALTIME, &tr);
+                    // the locked face the largest in view: the person at the camera
+                    int largest = 1;
+                    for (const cv::Rect& o : faces) if (o.area() > faces[0].area()) largest = 0;
+                    faceid_publish(camname.c_str(), e, (long long)tr.tv_sec * 1000000LL + tr.tv_nsec / 1000, nfaces, largest);
+                    faceid_refresh(&gallery);
+                    float sc = -1;
+                    const char* n = faceid_match(&gallery, e, &sc);
+                    if (!only_on) { who = n ? n : ""; who_score = sc; }
+                    else if (n && faceid_allowed(only, n) && sc >= only_min) { who = n; who_score = sc; strikes = 0; }
+                    else if (++strikes >= 3) {   // three looks in a row not them: let go
+                        have = false; who.clear(); strikes = 0;
+                    }
+                    id_done = true;
+                }
+                id_next = tnow + 0.5;
+            }
+            was_have = have;
+        }
 
         if (!status.empty()) {
             cv::resize(gray, mcur, cv::Size(96, std::max(1, gray.rows * 96 / std::max(1, gray.cols))), 0, 0, cv::INTER_AREA);
@@ -282,9 +447,10 @@ int main(int argc, char** argv) {
                     char line[256];
                     cv::Rect b = have ? (box & cv::Rect(0, 0, W, H)) : cv::Rect();
                     std::snprintf(line, sizeof line,
-                        "t=%lld cam=%s faces=%d locked=%d box=%d,%d,%d,%d motion=%.3f light=%d fps=%d\n",
+                        "t=%lld cam=%s faces=%d locked=%d box=%d,%d,%d,%d motion=%.3f light=%d fps=%d who=%s sim=%.2f\n",
                         (long long)tsp.tv_sec * 1000000LL + tsp.tv_nsec / 1000, camname.c_str(), sec_faces,
-                        have ? 1 : 0, b.x, b.y, b.width, b.height, sec_motion, (int)sec_light, sec_frames);
+                        have ? 1 : 0, b.x, b.y, b.width, b.height, sec_motion, (int)sec_light, sec_frames,
+                        !(have && fid && id_done) ? "-" : who.empty() ? "unknown" : who.c_str(), have && id_done ? who_score : 0.0f);
                     std::string tmp = status + ".status.tmp";
                     if (FILE* f = std::fopen(tmp.c_str(), "w")) {
                         std::fputs(line, f); std::fclose(f);
@@ -327,7 +493,19 @@ int main(int argc, char** argv) {
         int bl = 0; cv::Size sz = cv::getTextSize(st, cv::FONT_HERSHEY_SIMPLEX, 0.6, 1, &bl);
         cv::putText(frame, st, cv::Point(W - sz.width - 24, H - 22), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 0, 0), 3, cv::LINE_AA);
         cv::putText(frame, st, cv::Point(W - sz.width - 24, H - 22), cv::FONT_HERSHEY_SIMPLEX, 0.6, have ? cv::Scalar(255, 255, 255) : cv::Scalar(120, 120, 120), 1, cv::LINE_AA);
-        if (have) reticle(frame, box & cv::Rect(0, 0, W, H), cv::Scalar(255, 255, 255), 1);
+        if (have) {
+            // ADMIN, as before, while nobody is enrolled (or without the
+            // model); with a gallery: the name in white, UNKNOWN in the
+            // Machine's yellow, IDENTIFYING in grey until the first look.
+            std::string tag = "ADMIN";
+            cv::Scalar col(255, 255, 255);
+            if (fid && gallery.people > 0) {
+                if (!id_done) { tag = "IDENTIFYING"; col = cv::Scalar(170, 170, 170); }
+                else if (who.empty()) { tag = "UNKNOWN"; col = cv::Scalar(0, 208, 255); }
+                else { tag = who; for (auto& ch : tag) ch = (char)toupper((unsigned char)ch); }
+            }
+            reticle(frame, box & cv::Rect(0, 0, W, H), col, tag.c_str());
+        }
 
         // newest frame for Claude, ~1/s
         if (now != last_snap) { last_snap = now; cv::imwrite(snap, frame); }

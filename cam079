@@ -3,7 +3,7 @@
 # replaced every second: ~/.cache/voice-079/cam/latest.jpg (nothing else is
 # kept). For Claude to look when asked, and for the voice to tell whether
 # the person faces the computer.
-#   cam079 start | view (a live window too) | style machine|nexpo|raw | stop | status
+#   cam079 start | view (a live window too) | split | style machine|nexpo|raw | main [SIZE FPS NAME | auto] | stop | status
 set -u
 dir="$HOME/.cache/voice-079/cam"
 # Proper scaling for every feed (mpv, on the 3090 Ti): a Jinc upscaler
@@ -21,10 +21,32 @@ pidf="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/speak-079/cam.pid"
 st="$(dirname "$(readlink -f "$0")")/state079"
 export CAM079_SCREEN="${CAM079_SCREEN:-$("$st" get screen DP-2)}"
 mkdir -p "$dir" "$(dirname "$pidf")"
-# The best camera there is: of every capture device, the one whose largest
-# MJPEG size at 30 frames a second or more is biggest (a new, better webcam
-# wins over the C310 without being told). Prints the device, size and rate.
+# The main camera. Pinned (cam079 main SIZE FPS NAME, kept as state079
+# maincam; the person's choice on 2026-10-07: the camera on the capture card,
+# "USB3.0 Video", at 1920x1080 and 60 frames a second, 16:9): the capture
+# device whose name holds NAME, in that MJPEG mode, while it is plugged in.
+# Otherwise the best camera there is: of every capture device, the one whose
+# largest MJPEG size at 30 frames a second or more is biggest (a new, better
+# webcam wins over the C310 without being told). Prints the device, size,
+# rate, and "pinned" for the pinned camera.
 find_cam() {
+    local pin psize pfps pname
+    pin=$("$st" get maincam "")
+    if [ -n "$pin" ]; then
+        read -r psize pfps pname <<< "$pin"
+        for v in /sys/class/video4linux/video*; do
+            grep -qF "$pname" "$v/name" 2>/dev/null || continue
+            local dv="/dev/$(basename "$v")"
+            if v4l2-ctl -d "$dv" --list-formats-ext 2>/dev/null | awk -v s="$psize" -v f="$pfps" '
+                /\[[0-9]+\]:/ { mj = ($0 ~ /MJPG/) }
+                mj && /Size/ { sz = $3 }
+                mj && /Interval/ { r = $4; gsub(/[(]/, "", r); if (sz == s && int(r + 0.5) == f + 0) ok = 1 }
+                END { exit !ok }'; then
+                echo "$dv $psize $pfps pinned"
+                return
+            fi
+        done
+    fi
     local best="" bestpx=0
     for v in /sys/class/video4linux/video*; do
         local dv="/dev/$(basename "$v")"
@@ -40,7 +62,7 @@ find_cam() {
     done
     echo "$best"
 }
-read -r dev cam_size cam_fps <<< "$(find_cam)"
+read -r dev cam_size cam_fps _ <<< "$(find_cam)"
 # The other capture camera (any but the given one) that streams MJPEG.
 other_cam() {
     for v in /sys/class/video4linux/video*; do
@@ -89,9 +111,9 @@ case "${1:-}" in
         # arrive.
         here=$(dirname "$0")
         _split_one() {   # SIDE (inside|outside) STYLE SNAPSHOT
-            local side=$1 style=$2 snap=$3 d size fps
+            local side=$1 style=$2 snap=$3 d size fps pinned
             while :; do
-                read -r d size fps <<< "$(find_cam)"
+                read -r d size fps pinned <<< "$(find_cam)"
                 [ "$side" = outside ] && { d=$(other_cam "$d"); size=1280x960; fps=30; }
                 if [ -z "$d" ]; then sleep 1; continue; fi
                 # Night exposure for the outside camera, set each time it starts
@@ -112,10 +134,18 @@ case "${1:-}" in
                     # monitor's feed (it reads text, not pictures).
                     local feeds="${CAM079_FEEDS:-$HOME/.local/share/phi-stream/dev/feeds}"
                     mkdir -p "$feeds"
-                    FACETRACK_STATUS="$feeds/inside" FACETRACK_SNAP="$snap" "$here/facetrack" "$d" "${size%x*}" "${size#*x}" "SUBJECT: ADMIN" 2>> "$dir/cam.log" |
+                    # OpenCV's pool spins between jobs (15 workers at 16 % each,
+                    # 2026-10-03): no active wait, 4 threads.
+                    # A pinned camera runs at its pinned rate (facetrack's
+                    # own default, 15, was for the old webcam's USB 2.0 hub).
+                    local frate="${FACETRACK_FPS:-}"
+                    [ -z "$frate" ] && { [ "$pinned" = pinned ] && frate=$fps || frate=15; }
+                    # Only the user is locked here (faceid: "admin"; the user, 2026-10-07:
+                    # "only lock onto me"); CAM079_ONLY= (empty) for any face.
+                    FACETRACK_ONLY="${CAM079_ONLY-admin}" FACETRACK_FPS="$frate" OPENCV_THREAD_POOL_ACTIVE_WAIT_WORKER=0 OPENCV_THREAD_POOL_ACTIVE_WAIT_MAIN=0 OPENCV_THREAD_POOL_ACTIVE_WAIT_PAUSE_LIMIT=0 OPENCV_FOR_THREADS_NUM="${FACETRACK_THREADS:-4}" FACETRACK_STATUS="$feeds/inside" FACETRACK_SNAP="$snap" "$here/facetrack" "$d" "${size%x*}" "${size#*x}" "SUBJECT: ADMIN" 2>> "$dir/cam.log" |
                         mpv --really-quiet --profile=low-latency --untimed --no-cache \
                             $MPV_HQ --glsl-shaders="$here/shaders/FSR.glsl" \
-                            --ontop --no-border --screen-name="${CAM079_SCREEN:-DP-2}" \
+                            --no-border --screen-name="${CAM079_SCREEN:-DP-2}" \
                             --title="079 $side" - &
                     p=$!
                 else
@@ -127,7 +157,7 @@ case "${1:-}" in
                         mpv --really-quiet --demuxer-lavf-format=nut \
                             --profile=low-latency --untimed --no-cache \
                             $MPV_HQ --glsl-shaders="$here/shaders/FSR.glsl" \
-                            --ontop --no-border --screen-name="${CAM079_SCREEN:-DP-2}" \
+                            --no-border --screen-name="${CAM079_SCREEN:-DP-2}" \
                             --title="079 $side" --vf="lavfi=graph=%$n%$g" - &
                     p=$!
                 fi
@@ -158,8 +188,8 @@ case "${1:-}" in
 var ws = workspace.windowList(), x = $sx + Math.floor(($sw - $wi - $wo) / 2), y = $sy + Math.floor(($sh - $h) / 2);
 for (var i = 0; i < ws.length; i++) {
     var c = ws[i].caption;
-    if (c == "079 inside") { ws[i].noBorder = true; ws[i].keepAbove = true; ws[i].frameGeometry = {x: x, y: y, width: $wi, height: $h}; }
-    if (c == "079 outside") { ws[i].noBorder = true; ws[i].keepAbove = true; ws[i].frameGeometry = {x: x + $wi, y: y, width: $wo, height: $h}; }
+    if (c == "079 inside") { ws[i].noBorder = true; ws[i].keepAbove = false; ws[i].frameGeometry = {x: x, y: y, width: $wi, height: $h}; }
+    if (c == "079 outside") { ws[i].noBorder = true; ws[i].keepAbove = false; ws[i].frameGeometry = {x: x + $wi, y: y, width: $wo, height: $h}; }
 }
 EOF
             id=$(qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.loadScript "$js" cam079split 2>/dev/null)
@@ -174,7 +204,7 @@ EOF
         # The capture and its window, started again whenever the camera
         # comes back (moved to another port, plugged in again).
         while :; do
-            read -r d size fps <<< "$(find_cam)"
+            read -r d size fps _ <<< "$(find_cam)"
             if [ -z "$d" ]; then sleep 1; continue; fi
             # The window: mpv, the look applied by lavfi, and FSR (AMD's open
             # spatial upscaler, a GPU shader of a few kilobytes) for the stretch to
@@ -185,7 +215,7 @@ EOF
                 -map 0 -vf fps=1 -update 1 -y "$dir/latest.jpg" -map 0 -c:v copy -f nut - |
                 mpv --really-quiet --demuxer-lavf-format=nut \
                     --profile=low-latency --untimed --no-cache \
-                    $MPV_HQ --glsl-shaders="$(dirname "$0")/shaders/FSR.glsl" --ontop --title='What Claude sees' \
+                    $MPV_HQ --glsl-shaders="$(dirname "$0")/shaders/FSR.glsl" --title='What Claude sees' \
                     --vf="lavfi=graph=%$n%$g" --fs --fs-screen-name="${CAM079_SCREEN:-DP-2}" -
             sleep 1
         done
@@ -223,6 +253,32 @@ EOF
         fi
         exec "$0" view
         ;;
+    main)
+        # The main (inside) camera: cam079 main SIZE FPS NAME pins it (NAME:
+        # part of the device's name, v4l2-ctl --list-devices), cam079 main
+        # auto goes back to the best camera there is; cam079 main alone
+        # says which. What runs picks it up at once.
+        shift
+        if [ "${1:-}" = auto ]; then
+            "$st" set maincam ""
+        elif [ $# -ge 3 ]; then
+            [[ "$1" =~ ^[0-9]+x[0-9]+$ && "$2" =~ ^[0-9]+$ ]] || { echo "cam079 main SIZE FPS NAME, e.g. cam079 main 1920x1080 60 USB3.0 Video" >&2; exit 1; }
+            "$st" set maincam "$*"
+        elif [ $# -gt 0 ]; then
+            echo "cam079 main SIZE FPS NAME | auto" >&2; exit 1
+        fi
+        read -r d size fps pinned <<< "$(find_cam)"
+        p=$("$st" get maincam "")
+        if [ -n "$p" ] && [ "$pinned" != pinned ]; then
+            echo "cam079: main camera pinned to $p, not plugged in (or no such mode); using ${d:-none} $size@$fps meanwhile"
+        else
+            echo "cam079: main camera ${d:-none} $size@$fps${p:+ (pinned: $p)}"
+        fi
+        # A capture already running starts again on it.
+        if [ $# -gt 0 ]; then
+            case "$("$st" get cams off)" in split | view | start) exec "$0" "$("$st" get cams)" ;; esac
+        fi
+        ;;
     stop)
         # The person's stop: kept for the next login (state079). The verbs
         # that restart the capture call _stop, which leaves the state alone.
@@ -237,5 +293,5 @@ EOF
     status)
         if [ -f "$pidf" ] && kill -0 "$(cat "$pidf")" 2>/dev/null; then echo "cam079: on"; else echo "cam079: off"; fi
         ;;
-    *) echo "cam079 start|view|stop|status" >&2; exit 1 ;;
+    *) echo "cam079 start|view|split|style STYLE|main [SIZE FPS NAME|auto]|stop|status" >&2; exit 1 ;;
 esac

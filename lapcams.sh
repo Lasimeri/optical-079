@@ -23,6 +23,13 @@ fi
 "$st" set lapcams on
 echo $$ > "$rt/lapcams.pid"
 touch "$rt/camgrid"
+# The laptops' addresses and login stay out of the code too: a local file
+# ($LAPCAMS_CONF, default ~/.config/voice-079/lapcams.conf) sets E16_IP and
+# YG6_IP (and LAPTOP_USER, default this user; LAPTOP_SSH_PASS_FILE).
+cfg="${LAPCAMS_CONF:-$HOME/.config/voice-079/lapcams.conf}"
+# shellcheck disable=SC1090
+[ -f "$cfg" ] && . "$cfg"
+: "${E16_IP:?lapcams: set E16_IP (the laptop) in $cfg}" "${YG6_IP:?lapcams: set YG6_IP (the bedroom laptop) in $cfg}"
 # The laptops' SSH password stays out of the code: a private file
 # ($LAPTOP_SSH_PASS_FILE, default ~/.config/voice-079/laptop-ssh-pass, mode
 # 600) that a tiny askpass helper reads. SSH keys would be better still.
@@ -43,12 +50,12 @@ pull() {   # IP TITLE
         env SSH_ASKPASS="$A" SSH_ASKPASS_REQUIRE=force DISPLAY=:0 \
             ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no \
                 -o NumberOfPasswordPrompts=1 -o ConnectTimeout=10 \
-                -o ServerAliveInterval=15 -o ServerAliveCountMax=2 -o StrictHostKeyChecking=no "lasimeri@$1" \
+                -o ServerAliveInterval=15 -o ServerAliveCountMax=2 -o StrictHostKeyChecking=no "${LAPTOP_USER:-$USER}@$1" \
             "bash -c 'while :; do cat /dev/shm/facetrack.jpg 2>/dev/null; sleep 0.066; done'" > "$fifo" 2>/dev/null &
         sp=$!
         mpv --really-quiet --profile=low-latency --untimed --no-cache \
             --demuxer-lavf-format=mjpeg $MPV_HQ --glsl-shaders="$here/shaders/FSR.glsl" \
-            --ontop --no-border --screen-name="${CAM079_SCREEN:-DP-2}" \
+            --no-border --screen-name="${CAM079_SCREEN:-DP-2}" \
             --title="$2" - < "$fifo" 2>/dev/null
         kill "$sp" 2>/dev/null; wait "$sp" 2>/dev/null
         sleep 2
@@ -65,12 +72,12 @@ status_pull() {   # IP NAME
         # The media check (laptop-media-status.sh) copied over on each connect.
         env SSH_ASKPASS="$A" SSH_ASKPASS_REQUIRE=force DISPLAY=:0 \
             ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no \
-                -o NumberOfPasswordPrompts=1 -o ConnectTimeout=10 -o StrictHostKeyChecking=no "lasimeri@$1" \
+                -o NumberOfPasswordPrompts=1 -o ConnectTimeout=10 -o StrictHostKeyChecking=no "${LAPTOP_USER:-$USER}@$1" \
             "mkdir -p ~/.cache/lapcam; cat > ~/.cache/lapcam/media.sh" < "$here/laptop-media-status.sh" 2>/dev/null
         env SSH_ASKPASS="$A" SSH_ASKPASS_REQUIRE=force DISPLAY=:0 \
             ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no \
                 -o NumberOfPasswordPrompts=1 -o ConnectTimeout=10 \
-                -o ServerAliveInterval=15 -o ServerAliveCountMax=2 -o StrictHostKeyChecking=no "lasimeri@$1" \
+                -o ServerAliveInterval=15 -o ServerAliveCountMax=2 -o StrictHostKeyChecking=no "${LAPTOP_USER:-$USER}@$1" \
             "bash -c 'while :; do cat /dev/shm/facetrack.status /dev/shm/mic.status 2>/dev/null; bash ~/.cache/lapcam/media.sh $2 2>/dev/null; sleep 1; done'" 2>/dev/null |
             while IFS= read -r line; do
                 # The camera's line goes to NAME, the voice detector's (mic=) to
@@ -99,9 +106,9 @@ status_pull() {   # IP NAME
         sleep 5
     done
 }
-pull "${E16_IP:-192.168.0.78}" "079 laptop" &
-pull "${YG6_IP:-192.168.0.125}" "079 bedroom" &
-status_pull "${E16_IP:-192.168.0.78}" laptop &
-status_pull "${YG6_IP:-192.168.0.125}" bedroom &
+pull "$E16_IP" "079 laptop" &
+pull "$YG6_IP" "079 bedroom" &
+status_pull "$E16_IP" laptop &
+status_pull "$YG6_IP" bedroom &
 ( for t in 2 2 3 5 8; do sleep "$t"; "$here/cam-grid-place"; done ) &
 wait

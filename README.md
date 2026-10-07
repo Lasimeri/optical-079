@@ -16,6 +16,9 @@ Everything runs on your own GPU. Face detection uses OpenCV's OpenCL path (any G
 | --- | --- |
 | `facetrack.cpp` | GPU face tracking + the Machine reticle/HUD; outputs YUV4MPEG2 for mpv |
 | `facegate.cpp` | presence/awake gate; writes a one-line state file |
+| `faceid.c`, `faceid.h`, `faceid_embed.c`, `faceid_net.cpp` | who a face is: a gallery of the people you enrol (one file each in `~/.local/share/faceid`, never in this repository), cosine matching of SFace embeddings, YuNet's five landmarks aligned to SFace's template in C; only the network's forward pass is C++ (OpenCV DNN, CUDA when OpenCV has it) |
+| `faceid_cli.c` | `faceid enroll NAME`, `who`, `list`, `forget`: enrolment from a running tracker, plain C |
+| `build-face.sh` | builds `faceid` and `facetrack` with the face identity (the models in `models/`: YuNet and SFace from the OpenCV model zoo, Apache 2.0) |
 | `cam079` | the camera runner: `split` (two cams), `view` (one), `stop`, styles |
 | `cam-style-*.filter` | ffmpeg looks: `admin`, `night`, `machine`, `nexpo`, `color` |
 | `shaders/FSR.glsl` | AMD FidelityFX Super Resolution upscaler for mpv (MIT, see below) |
@@ -84,7 +87,7 @@ Run `facetrack` standalone against any camera:
 Show other machines' cameras beside the desktop's own:
 
 1. **On each laptop**, copy `facetrack.cpp` and `laptop/` over and build `facetrack`. Run `laptop/facetrack.sh`, or install `laptop/facetrack.desktop` into `~/.config/autostart` (edit its path) to start at login. Besides its own window, the laptop publishes every second annotated frame to `/dev/shm/facetrack.jpg` (`FACETRACK_STREAM`), written to a temporary name and renamed into place, so a reader never sees half a file.
-2. **On the desktop**, `lapcams.sh` pulls each laptop's frames over SSH as a live MJPEG stream into a window ("079 laptop", "079 bedroom"). It reconnects on its own and uses the same GPU scalers and FSR as the desktop cameras. Set laptop addresses with `E16_IP` / `YG6_IP`. The password comes from a private file, as in voice-079 (`LAPTOP_SSH_PASS_FILE`).
+2. **On the desktop**, `lapcams.sh` pulls each laptop's frames over SSH as a live MJPEG stream into a window ("079 laptop", "079 bedroom"). It reconnects on its own and uses the same GPU scalers and FSR as the desktop cameras. The laptops' addresses and login live in a local file outside the repository, `~/.config/voice-079/lapcams.conf` (`E16_IP=...`, `YG6_IP=...`, optionally `LAPTOP_USER`, `LAPTOP_SSH_PASS_FILE`; `LAPCAMS_CONF` names another); the password comes from a private file, as in voice-079.
 3. `cam-grid-place` lays out all four on the camera screen: inside top-left, outside top-right, laptop bottom-left, bedroom bottom-right. 4:3 feeds get a 4:3 window centred in their cell. `cam079` defers to the grid when `$XDG_RUNTIME_DIR/speak-079/camgrid` exists, which `lapcams.sh` creates.
 
 Stop the laptop feeds with `kill -- -$(cat $XDG_RUNTIME_DIR/speak-079/lapcams.pid)`.

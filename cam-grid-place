@@ -13,13 +13,17 @@
 #                  itself: a camera reconnecting or a laptop coming back snaps
 #                  straight into place, with no polling
 #   --stop         unload the resident script
-#   --layout L     featured | grid, kept for the next login, applied now
+#   --layout L     featured | grid | column (all stacked), kept for the next
+#                  login, applied now
 #   --screen S     the camera screen (an output name), kept and applied now
+#   --area A       the part of that screen the cameras use, X,Y,W,H relative
+#                  to the screen (or "full"), kept and applied now; the rest
+#                  stays free for other windows (rack-monitors uses it)
 set -u
 here=$(dirname "$(readlink -f "$0")")
 st="$here/state079"
 case "${1:-}" in
-    --layout|--screen)
+    --layout|--screen|--area)
         [ -n "${2:-}" ] || { echo "cam-grid-place $1 VALUE" >&2; exit 1; }
         "$st" set "${1#--}" "$2"
         # Applied at once: the resident script reloaded with the new value.
@@ -31,7 +35,9 @@ case "${1:-}" in
 esac
 # The person's choice (state079), unless given for this run.
 screen="${CAM079_SCREEN:-$("$st" get screen DP-2)}"
-layout="${CAM079_LAYOUT:-$("$st" get layout featured)}"     # featured (one big + the rest stacked) | grid
+layout="${CAM079_LAYOUT:-$("$st" get layout featured)}"     # featured (one big + the rest stacked) | grid | column
+area="${CAM079_AREA:-$("$st" get area full)}"                # X,Y,W,H inside the screen, or full
+case "$area" in [0-9]*,[0-9]*,[0-9]*,[0-9]*) ;; *) area=full ;; esac
 rt="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/speak-079"
 mkdir -p "$rt"
 name=cam079grid
@@ -41,9 +47,16 @@ cat <<EOF
 var SCREEN = "$screen";
 var ORDER = ["079 inside", "079 outside", "079 laptop", "079 bedroom"];
 var ASPECT = {"079 inside": 16 / 9, "079 outside": 4 / 3, "079 laptop": 16 / 9, "079 bedroom": 4 / 3};
+var AREA = "$area";
+// The screen's rectangle, or the part of it AREA names (relative X,Y,W,H).
 function screenGeo() {
     var ss = workspace.screens;
-    for (var i = 0; i < ss.length; i++) if (ss[i].name == SCREEN) return ss[i].geometry;
+    for (var i = 0; i < ss.length; i++) if (ss[i].name == SCREEN) {
+        var g = ss[i].geometry;
+        if (AREA == "full") return g;
+        var a = AREA.split(",");
+        return {x: g.x + parseInt(a[0]), y: g.y + parseInt(a[1]), width: parseInt(a[2]), height: parseInt(a[3])};
+    }
     return null;
 }
 function camWindows(skip) {
@@ -61,7 +74,7 @@ function place(win, cx, cy, cw, ch) {
     if (h > ch) { h = ch; w = Math.floor(ch * a); }
     var x = cx + Math.floor((cw - w) / 2), y = cy + Math.floor((ch - h) / 2);
     var f = win.frameGeometry;
-    win.noBorder = true; win.keepAbove = true;
+    win.noBorder = true; win.keepAbove = false;
     // only move what is off target: no feedback loop with resize signals
     if (Math.abs(f.x - x) > 2 || Math.abs(f.y - y) > 2 || Math.abs(f.width - w) > 2 || Math.abs(f.height - h) > 2)
         win.frameGeometry = {x: x, y: y, width: w, height: h};
@@ -70,6 +83,11 @@ function layout(skip) {
     var g = screenGeo(); if (!g) return;
     var wins = camWindows(skip), n = wins.length; if (!n) return;
     if (n == 1) { place(wins[0], g.x, g.y, g.width, g.height); return; }
+    if (LAYOUT == "column") {
+        var rh = Math.floor(g.height / n);
+        for (var q = 0; q < n; q++) place(wins[q], g.x, g.y + q * rh, g.width, rh);
+        return;
+    }
     if (LAYOUT == "grid") {
         var cols = Math.ceil(Math.sqrt(n)), rows = Math.ceil(n / cols);
         var cw = Math.floor(g.width / cols), ch = Math.floor(g.height / rows);
