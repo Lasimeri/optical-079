@@ -1,11 +1,11 @@
 #!/bin/bash
 # cam-grid-place [--watch | --stop]: the camera windows ("079 inside",
-# "079 outside", "079 laptop", "079 bedroom") laid out on the camera screen
+# "079 outside", "079 laptop", "079 bedroom", "079 glass") laid out on the camera screen
 # (CAM079_SCREEN, default DP-2), adapting to however many are open: one fills
 # the screen, two sit side by side, three go two over one (the short row
 # centred), four make a 2x2 grid. Each keeps its picture's aspect (16:9 or
 # 4:3), centred in its cell, borderless and above other windows. The order
-# is fixed (inside, outside, laptop, bedroom), so a camera keeps its place
+# is fixed (inside, outside, laptop, bedroom, glass), so a camera keeps its place
 # relative to the others.
 #   (no argument)  lay out once
 #   --watch        load it as a resident KWin script that lays out again the
@@ -45,8 +45,8 @@ name=cam079grid
 layout_js() {
 cat <<EOF
 var SCREEN = "$screen";
-var ORDER = ["079 inside", "079 outside", "079 laptop", "079 bedroom"];
-var ASPECT = {"079 inside": 16 / 9, "079 outside": 4 / 3, "079 laptop": 16 / 9, "079 bedroom": 4 / 3};
+var ORDER = ["079 inside", "079 outside", "079 laptop", "079 bedroom", "079 glass"];
+var ASPECT = {"079 inside": 16 / 9, "079 outside": 4 / 3, "079 laptop": 16 / 9, "079 bedroom": 4 / 3, "079 glass": 16 / 9};
 var AREA = "$area";
 // The screen's rectangle, or the part of it AREA names (relative X,Y,W,H).
 function screenGeo() {
